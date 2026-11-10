@@ -127,6 +127,8 @@ test/js/bun/test/mock/mock-module.test.ts: unmock > the modules that imported th
 test/js/bun/test/mock/mock-module.test.ts: unmock > the modules that imported the mock are loaded again []
 test/js/bun/test/mock/mock-module.test.ts: vi.doMock() from bun:test leaves a module that is already loaded as it is
 test/js/bun/test/mock/mock-module.test.ts: vi.doMock() from vitest leaves a module that is already loaded as it is
+# The next one arms a getter on the module object of "vitest" for the file after it. --isolate=modules runs like --isolate in a compiled run: each test file gets a module object of its own.
+test/js/bun/test/vitest-flavor.test.ts: [test] globals = "vitest" > an export that throws while the globals are defined fails that file, and the next file runs > --isolate=modules, which loads no preload for the file that fails
 test/js/bun/test/vitest-flavor.test.ts: [test] globals = "vitest" > is part of the transpiler cache key
 # A module that is being imported calls import(): a compiled run runs the inner module ahead of the `.then()` of the outer call, as the executable and Node.js do. `bun test` reads the inner file on another thread first.
 test/js/bun/test/vi-utils.test.ts: vi.dynamicImportSettled > waits for the imports in flight and the ones they start
