@@ -3101,8 +3101,8 @@ struct ModulesToEvict {
     Vector<String> packagesSetAside;
     // An importer of a patched module stays registered if the running test file holds it: see isHeldByTestFile().
     bool keepsWhatTestFileHolds { false };
-    // With keepsWhatTestFileHolds: evicts nothing, and says whether the running test file holds the patched module.
-    bool* holdsPatchedModule { nullptr };
+    // With keepsWhatTestFileHolds: the pass is made only if the running test file holds the patched module, and this says whether it does.
+    bool* onlyIfTestFileHoldsPatchedModule { nullptr };
     // Forces a pass even with nothing listed, to sweep the modules that failed to load or threw.
     bool isEndOfTestFile { false };
     bool hasLoadSettled { false };
@@ -3510,9 +3510,11 @@ __attribute__((minsize)) static void evictModulesAndTheirImporters(Zig::GlobalOb
             holds = collectHoldsOfTestFile(globalObject, registeredKeys, requireKeys);
         return !scope.exception() && isHeldByTestFile(globalObject, importersOf, *holds, module);
     };
-    if (evict.holdsPatchedModule) {
-        *evict.holdsPatchedModule = isHeld(evict.patchedESModules[0]);
-        return;
+    if (evict.onlyIfTestFileHoldsPatchedModule) {
+        *evict.onlyIfTestFileHoldsPatchedModule = isHeld(evict.patchedESModules[0]);
+        RETURN_IF_EXCEPTION(scope, );
+        if (!*evict.onlyIfTestFileHoldsPatchedModule)
+            return;
     }
 
     // A load stuck behind an abandoned fetch never finishes, so the entries waiting on it don't have to stay.
@@ -5530,27 +5532,21 @@ __attribute__((minsize)) static JSC::EncodedJSValue mockModule(JSC::JSGlobalObje
         loaded = findLoadedModule(globalObject, specifierString);
         RETURN_IF_EXCEPTION(scope, {});
     }
-    // The file that fetched the module doesn't say whether this one has imported it: a later file is linked to the record that an earlier one left.
-    if (isDoMock && leavesLoadedModuleAlone && !staysTheOriginal && loadedByTestFile && !vm.hasCompiledCode() && (loaded.esmNamespace || loaded.commonJSModule)) {
-        ModulesToEvict ask;
-        ask.keepsWhatTestFileHolds = true;
-        ask.patchedESModules.append(specifier);
-        ask.holdsPatchedModule = &staysTheOriginal;
-        evictModulesAndTheirImporters(globalObject, WTF::move(ask));
+    bool isLoadInFlight = loaded.staleESMEntry;
+    // vi.doMock(): the file that fetched the module doesn't say whether this one has imported it. The pass below says, and is made only if this file holds the module.
+    bool asksWhetherHeld = isDoMock && leavesLoadedModuleAlone && !staysTheOriginal && loadedByTestFile && !vm.hasCompiledCode();
+    // Before the move, while its importers are found under this key.
+    if (leavesLoadedModuleAlone && (staysTheOriginal || asksWhetherHeld) && (loaded.esmNamespace || loaded.commonJSModule) && loadedByTestFile != globalObject->onLoadPlugins.testFile) {
+        ModulesToEvict evict;
+        evict.keepsWhatTestFileHolds = true;
+        evict.onlyIfTestFileHoldsPatchedModule = asksWhetherHeld ? &staysTheOriginal : nullptr;
+        evict.patchedESModules.append(specifier);
+        evict.patchedCommonJSModules.append(specifier);
+        evict.packagesSetAside.append(specifier);
+        evictModulesAndTheirImporters(globalObject, WTF::move(evict));
         RETURN_IF_EXCEPTION(scope, {});
     }
-    bool isLoadInFlight = loaded.staleESMEntry;
     if (leavesLoadedModuleAlone && staysTheOriginal && (loaded.esmNamespace || loaded.commonJSModule)) {
-        // Before the move, while its importers are found under this key.
-        if (loadedByTestFile != globalObject->onLoadPlugins.testFile) {
-            ModulesToEvict evict;
-            evict.keepsWhatTestFileHolds = true;
-            evict.patchedESModules.append(specifier);
-            evict.patchedCommonJSModules.append(specifier);
-            evict.packagesSetAside.append(specifier);
-            evictModulesAndTheirImporters(globalObject, WTF::move(evict));
-            RETURN_IF_EXCEPTION(scope, {});
-        }
         setLoadedModuleAside(globalObject, specifier);
         RETURN_IF_EXCEPTION(scope, {});
 #if ENABLE(AOT)
