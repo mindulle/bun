@@ -211,6 +211,40 @@ import "./more-styles.css";
 
 This generates `./app.css` and `./app.js` in the output directory. Bun bundles all CSS files imported from JavaScript into a single CSS file per entry point. If you import the same CSS file from multiple JavaScript files, Bun includes it only once in the output CSS file.
 
+### Stylesheet links with `media` or `disabled`
+
+Bun combines the stylesheets of a page into one CSS file. A stylesheet `<link>` with a `media` or `disabled` attribute is the exception. The browser reads those attributes from the element to decide whether the stylesheet applies. So Bun gives that stylesheet a CSS file of its own, and the `<link>` to that file keeps the attributes of your `<link>`.
+
+```html index.html icon="file-code"
+<head>
+  <link rel="stylesheet" href="./screen.css" />
+  <link rel="stylesheet" href="./print.css" media="print" />
+</head>
+```
+
+`bun build` outputs:
+
+```html dist/index.html icon="file-code"
+<head>
+  <link rel="stylesheet" crossorigin href="./index-[hash].css" />
+  <link rel="stylesheet" media="print" crossorigin href="./index-[hash].css" />
+  <script type="module" crossorigin src="./index-[hash].js"></script>
+</head>
+```
+
+The tags go before `</head>`, where Bun puts the one `<link>` of any other page. Their order is the order that the page loads its stylesheets in. The stylesheets that the page loads between two such links, from other links or from scripts, share one CSS file. The `<link>` keeps every attribute except `href` and `integrity`.
+
+Bun combines these links as usual:
+
+- A link whose `media` is empty or `all`. That `media` matches everything.
+- A link that has `media` and `onload`, such as `media="print" onload="this.media='all'"`. The handler changes `media` when the stylesheet has loaded, so the stylesheet is for every medium.
+- A `<link rel="preload" as="style">`.
+
+<Note>
+  A `<script>` in `<head>` that runs while the browser reads the page runs before these tags exist. To change `media` or
+  `disabled` from a script, put the script in `<body>` or wait for the `DOMContentLoaded` event.
+</Note>
+
 ## Plugins
 
 The dev server supports plugins.

@@ -1323,11 +1323,17 @@ pub struct JavaScriptChunk {
     pub(crate) cross_chunk_suffix_stmts: Vec<Stmt>,
 
     /// Indexes to CSS chunks. Currently this will only ever be zero or one
-    /// items long, but smarter css chunking will allow multiple js entry points
-    /// share a css file, or have an entry point contain multiple css files.
+    /// items long, or more for an HTML page with `html_css_tags`, but smarter
+    /// css chunking will allow multiple js entry points share a css file, or
+    /// have an entry point contain multiple css files.
     ///
     /// Mutated while sorting chunks in `computeChunks`
     pub(crate) css_chunks: Box<[u32]>,
+    /// The stylesheet tags of an HTML page that has a stylesheet `<link>` with
+    /// `media` or `disabled` (`ImportRecordFlags::HTML_LINK_CONDITIONAL`), in
+    /// cascade order. Empty for every other chunk: an HTML page then links
+    /// `css_chunks[0]`.
+    pub(crate) html_css_tags: Box<[HtmlCssTag]>,
 
     /// Serialized ModuleInfo for ESM bytecode (--compile --bytecode --format=esm)
     pub(crate) module_info_bytes: Option<Box<[u8]>>,
@@ -1335,8 +1341,35 @@ pub struct JavaScriptChunk {
     pub(crate) module_info: Option<Box<analyze_transpiled_module::ModuleInfo>>,
 }
 
+/// One stylesheet tag of an HTML page, see `JavaScriptChunk::html_css_tags`.
+#[derive(Clone, Copy)]
+pub(crate) struct HtmlCssTag {
+    /// An index into `JavaScriptChunk::css_chunks`.
+    pub(crate) css_chunk: u32,
+    /// The import record of the `<link>` whose attributes the tag keeps.
+    /// `None`: the chunk is the CSS that the page's other links and its
+    /// scripts load, and the tag is the one that Bun makes for every page.
+    pub(crate) link: Option<u32>,
+}
+
+/// See `CssChunk::of_html_page`.
+#[derive(Clone, Copy)]
+pub(crate) struct CssChunkOfHtmlPage {
+    /// The page made this chunk as its `nth` CSS chunk, from 1.
+    pub(crate) nth: u32,
+    /// The chunk is the stylesheet of one `<link>` with `media` or `disabled`,
+    /// and not the CSS between two of them.
+    pub(crate) is_link: bool,
+}
+
 pub struct CssChunk<'a> {
     pub(crate) imports_in_chunk_in_order: Vec<CssImportOrder<'a>>,
+    /// Set for a CSS chunk of an HTML page that has a stylesheet `<link>` with
+    /// `media` or `disabled` (`ImportRecordFlags::HTML_LINK_CONDITIONAL`).
+    /// Every other entry point has at most one CSS chunk. Such a page has one
+    /// per tag of `JavaScriptChunk::html_css_tags`, and shares them only with
+    /// other such pages.
+    pub(crate) of_html_page: Option<CssChunkOfHtmlPage>,
     /// When creating a chunk, this is to be an uninitialized slice with
     /// length of `imports_in_chunk_in_order`
     ///

@@ -20,7 +20,8 @@ const registeredLinkTags = new Map<HTMLLinkElement, string>();
 
 interface CSS {
   sheet: CSSStyleSheet | null;
-  link: HTMLLinkElement | null;
+  /** An HTML page has one <link> more for each `media` or `disabled` that it links the stylesheet with. */
+  links: HTMLLinkElement[];
   active: boolean;
 }
 
@@ -30,28 +31,35 @@ function validateCssId(id: string) {
   }
 }
 
+// Once there is `css.sheet`, it is in place of the sheets of the <link> tags.
+// It applies when one of them would.
+function sync(css: CSS) {
+  const { sheet, links, active } = css;
+  // The media of the <link> tags that are not `disabled`. Without a <link>, a script imports the stylesheet.
+  let media: string[] | null = links.length ? null : [];
+  for (const link of links) {
+    const linkSheet = link.sheet;
+    if (linkSheet) linkSheet.disabled = !active || !!sheet;
+    if (!link.hasAttribute("disabled")) (media ??= []).push(link.media.trim());
+  }
+  if (sheet) {
+    sheet.disabled = !active || !media;
+    // An empty media applies always. `media` forwards an assigned string to its `mediaText`.
+    if (media) (sheet as { media: MediaList | string }).media = media.includes("") ? "" : media.join(",");
+  }
+}
+
 function deactivateCss(css: CSS) {
   if (css.active) {
-    const { sheet, link } = css;
     css.active = false;
-    if (sheet) {
-      sheet.disabled = true;
-    } else if (link) {
-      const linkSheet = link.sheet;
-      if (linkSheet) linkSheet.disabled = true;
-    }
+    sync(css);
   }
 }
 
 function activateCss(css: CSS) {
   if (!css.active) {
     css.active = true;
-    if (css.sheet) {
-      css.sheet.disabled = false;
-    } else if (css.link) {
-      const linkSheet = css.link.sheet;
-      if (linkSheet) linkSheet.disabled = false;
-    }
+    sync(css);
   }
 }
 
@@ -70,7 +78,14 @@ const headObserver = new MutationObserver(list => {
         if (id) {
           const existingSheet = cssStore.get(id);
           if (existingSheet) {
-            deactivateCss(existingSheet);
+            const { links } = existingSheet;
+            const index = links.indexOf(node as HTMLLinkElement);
+            if (index !== -1) links.splice(index, 1);
+            if (links.length === 0) {
+              deactivateCss(existingSheet);
+            } else {
+              sync(existingSheet);
+            }
           }
           registeredLinkTags.delete(node as HTMLLinkElement);
         }
@@ -86,19 +101,15 @@ const headObserver = new MutationObserver(list => {
         i++;
       }
     } else if (mutation.type === "attributes") {
-      // This allows frameworks to set the `disabled` attribute on the link tag
+      // This allows frameworks to set the `disabled` and `media` attributes on the link tag
       const target = mutation.target as HTMLLinkElement;
       if (target.tagName === "LINK" && target.rel === "stylesheet") {
         const id = registeredLinkTags.get(target);
         if (id) {
           const existing = cssStore.get(id);
           if (existing) {
-            const disabled = target.disabled;
-            if (disabled) {
-              deactivateCss(existing);
-            } else {
-              activateCss(existing);
-            }
+            if (!target.hasAttribute("disabled")) existing.active = true;
+            sync(existing);
           }
         }
       }
@@ -115,18 +126,14 @@ function maybeAddCssLink(link: HTMLLinkElement) {
     }
     const existing = cssStore.get(id);
     if (existing) {
-      const { sheet } = existing;
-      if (sheet) {
-        // The HMR runtime has a managed sheet already.
-        sheet.disabled = false;
-        const linkSheet = link.sheet;
-        if (linkSheet) linkSheet.disabled = true;
-      }
-      existing.link = link;
+      if (!existing.links.includes(link)) existing.links.push(link);
+      // If the HMR runtime has a managed sheet already, it stays in place of the sheet of this link.
+      existing.active = true;
+      sync(existing);
     } else {
       cssStore.set(id, {
         sheet: null,
-        link,
+        links: [link],
         active: true,
       });
     }
@@ -139,7 +146,7 @@ headObserver.observe(document.head, {
   // TODO: consider using a separate observer for attributes, this can avoid subtree
   subtree: true,
   attributes: true,
-  attributeFilter: ["disabled"],
+  attributeFilter: ["disabled", "media"],
 });
 document.querySelectorAll<HTMLLinkElement>("head>link[rel=stylesheet]").forEach(maybeAddCssLink);
 
@@ -155,7 +162,7 @@ export function editCssArray(array: string[]) {
       // This will be populated shortly by a call to `editCssContent`
       cssStore.set(css, {
         sheet: null,
-        link: null,
+        links: [],
         active: true,
       });
     }
@@ -177,9 +184,8 @@ export function editCssContent(id: string, newContent: string) {
     sheet.replace(newContent);
     document.adoptedStyleSheets.push(sheet);
 
-    // Disable the link tag if it exists
-    const linkSheet = entry.link?.sheet;
-    if (linkSheet) linkSheet.disabled = true;
+    // Disable the link tags if they exist
+    sync(entry);
     return false;
   }
   sheet!.replace(newContent);

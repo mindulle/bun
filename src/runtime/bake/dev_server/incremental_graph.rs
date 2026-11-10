@@ -1337,6 +1337,47 @@ impl<const SIDE: bake::Side> IncrementalGraph<SIDE> {
         Ok(())
     }
 
+    /// `trace_imports(html_file, gts, FindCss)` for an HTML route that has
+    /// stylesheet links with `media` or `disabled` (`links`, see
+    /// `CompileResult::Html::css_links`). Such a link does not put its
+    /// stylesheet in `current_css_files`. Each `(n, i)` of the result says
+    /// where its tag goes: `links[i]`, before the tag of `current_css_files[n]`.
+    pub(crate) fn trace_css_of_html_links(
+        &mut self,
+        html_file: FileIndex<SIDE>,
+        links: &[(u64, Box<[u8]>)],
+        gts: &mut GraphTraceState,
+    ) -> Result<Vec<(usize, usize)>, crate::Error> {
+        let mut tags: Vec<(usize, usize)> = Vec::with_capacity(links.len());
+        gts.bits(SIDE).set(html_file.get() as usize);
+        let mut it = self.edge_lists[html_file.get() as usize].first_import;
+        while let Some(dep_index) = it {
+            let edge = self.edges[dep_index.get() as usize];
+            it = edge.next_import;
+            let css_root = match &self.bundled_files.values()[edge.imported.get() as usize].content
+            {
+                Content::CssRoot(id) => Some(*id),
+                _ => None,
+            };
+            let mut is_link = false;
+            for (i, (id, attributes)) in links.iter().enumerate() {
+                if Some(*id) != css_root {
+                    continue;
+                }
+                is_link = true;
+                if attributes.is_empty() {
+                    self.trace_imports(edge.imported, gts, TraceImportGoal::FindCss)?;
+                } else {
+                    tags.push((self.current_css_files.len(), i));
+                }
+            }
+            if !is_link {
+                self.trace_imports(edge.imported, gts, TraceImportGoal::FindCss)?;
+            }
+        }
+        Ok(tags)
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     // insertStale / insertEmpty / insertCssFileOnServer / insertFailure
     // ────────────────────────────────────────────────────────────────────────

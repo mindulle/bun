@@ -102,6 +102,8 @@ Images, fonts, WASM binaries, videos, audio files, SVGs: Bun base64-encodes any 
 
 Bun leaves external URLs (like CDN links or absolute URLs) untouched.
 
+A `<link rel="stylesheet">` with a `media` or `disabled` attribute stays a `<link>` with those attributes. Its `href` becomes a `data:` URL that holds the CSS of that stylesheet.
+
 ## Using with React
 
 React apps need no extra configuration: Bun transpiles JSX and resolves npm packages.

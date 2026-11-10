@@ -307,7 +307,13 @@ impl DevServer {
         )?;
         // Run tracing
         client_graph.reset();
-        client_graph.trace_imports(html.bundled_file, &mut gts, TraceImportGoal::FindCss)?;
+        // `(n, i)`: the tag of `html.css_links[i]` goes before the tag of `css_ids[n]`.
+        let link_tags: Vec<(usize, usize)> = if html.css_links.is_empty() {
+            client_graph.trace_imports(html.bundled_file, &mut gts, TraceImportGoal::FindCss)?;
+            Vec::new()
+        } else {
+            client_graph.trace_css_of_html_links(html.bundled_file, &html.css_links, &mut gts)?
+        };
 
         let css_ids: &[u64] = &client_graph.current_css_files;
 
@@ -316,6 +322,15 @@ impl DevServer {
                 + ASSET_PREFIX.len()
                 + "/0000000000000000.css\">".len())
                 * css_ids.len()
+            + (link_tags.iter())
+                .map(|&(_, i)| {
+                    "<link".len()
+                        + html.css_links[i].1.len()
+                        + " href=\"".len()
+                        + ASSET_PREFIX.len()
+                        + "/0000000000000000.css\">".len()
+                })
+                .sum::<usize>()
             + "<script type=\"module\" crossorigin src=\"\" data-bun-dev-server-script></script>"
                 .len()
             + CLIENT_PREFIX.len()
@@ -329,7 +344,20 @@ impl DevServer {
 
         // Insert all link tags before "</head>"
         let mut hex_buf = [0u8; 16];
-        for name in css_ids {
+        let mut link_tags = link_tags.iter().peekable();
+        for n in 0..=css_ids.len() {
+            while let Some(&(_, i)) = link_tags.next_if(|tag| tag.0 == n) {
+                let (id, attributes) = &html.css_links[i];
+                array.extend_from_slice(b"<link");
+                array.extend_from_slice(attributes);
+                array.extend_from_slice(b" href=\"");
+                array.extend_from_slice(ASSET_PREFIX.as_bytes());
+                array.extend_from_slice(b"/");
+                let len = bun_core::fmt::bytes_to_hex_lower(&id.to_ne_bytes(), &mut hex_buf);
+                array.extend_from_slice(&hex_buf[..len]);
+                array.extend_from_slice(b".css\">");
+            }
+            let Some(name) = css_ids.get(n) else { break };
             array.extend_from_slice(b"<link rel=\"stylesheet\" href=\"");
             array.extend_from_slice(ASSET_PREFIX.as_bytes());
             array.extend_from_slice(b"/");

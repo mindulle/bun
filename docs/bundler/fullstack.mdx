@@ -556,7 +556,7 @@ Bun uses `HTMLRewriter` to scan for `<script>` and `<link>` tags in HTML files a
 </Step>
 <Step title="4. HTML Rewriting">
 - Combines all `<script>` tags into a single `<script>` tag with a content-addressable hash in the URL
-- Combines all `<link>` tags into a single `<link>` tag with a content-addressable hash in the URL
+- Combines all `<link>` tags into a single `<link>` tag with a content-addressable hash in the URL. A stylesheet `<link>` with a `media` or `disabled` attribute gets [a `<link>` of its own](/bundler/html-static#stylesheet-links-with-media-or-disabled) that keeps those attributes
 - Outputs a new HTML file
 </Step>
 <Step title="5. Serving">

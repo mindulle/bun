@@ -68,7 +68,12 @@ impl<'a> HTMLScanner<'a> {
 }
 
 impl<'a> HTMLScanner<'a> {
-    fn create_import_record(&mut self, input_path: &[u8], kind: ImportKind) -> Result<(), Error> {
+    fn create_import_record(
+        &mut self,
+        input_path: &[u8],
+        kind: ImportKind,
+        flags: ImportRecordFlags,
+    ) -> Result<(), Error> {
         // In HTML, sometimes people do /src/index.js
         // In that case, we don't want to use the absolute filesystem path, we want to use the path relative to the project root
         let path_to_use: &[u8] = if input_path.len() > 1 && input_path[0] == b'/' {
@@ -115,7 +120,7 @@ impl<'a> HTMLScanner<'a> {
             loader: None,
             source_index: AstIndex::default(),
             original_path: b"",
-            flags: ImportRecordFlags::default(),
+            flags,
         };
 
         self.import_records.push(record);
@@ -136,13 +141,17 @@ impl<'a> HTMLScanner<'a> {
 
     fn on_tag(
         &mut self,
-        _element: &mut Element<'_, '_>,
+        element: &mut Element<'_, '_>,
         path: &[u8],
         url_attribute: &[u8],
         kind: ImportKind,
     ) {
         let _ = url_attribute;
-        let _ = self.create_import_record(path, kind);
+        let mut flags = ImportRecordFlags::default();
+        if kind == ImportKind::At && is_conditional_stylesheet_link(element) {
+            flags |= ImportRecordFlags::HTML_LINK_CONDITIONAL;
+        }
+        let _ = self.create_import_record(path, kind, flags);
     }
 
     pub(crate) fn scan(&mut self, input: &[u8]) -> Result<(), Error> {
@@ -280,6 +289,43 @@ const TAG_HANDLERS: [TagHandler; 16] = [
     //     // Iframes
     //     TagHandler::new("iframe[src]", "src", ImportKind::Url),
 ];
+
+/// `link` is a stylesheet `<link>` that has `disabled`, or a `media` that can
+/// fail to match. The browser reads both from the element, so the bundler
+/// must not merge the stylesheet into CSS that applies without the element
+/// (`ImportRecordFlags::HTML_LINK_CONDITIONAL`).
+///
+/// A link with `media` and `onload` is not one of these. In
+/// `media="print" onload="this.media='all'"` the handler changes `media` when
+/// the stylesheet has loaded, so the stylesheet is for every medium.
+fn is_conditional_stylesheet_link(link: &Element<'_, '_>) -> bool {
+    let mut rel = None;
+    let mut media = None;
+    let mut disabled = false;
+    let mut onload = false;
+    // The browser takes the first of two attributes with one name.
+    for attribute in link.attributes() {
+        match attribute.name().as_str() {
+            "rel" if rel.is_none() => rel = Some(attribute),
+            "media" if media.is_none() => media = Some(attribute),
+            "disabled" => disabled = true,
+            "onload" => onload = true,
+            _ => {}
+        }
+    }
+    if !disabled {
+        let Some(media) = media else { return false };
+        let media = media.value();
+        let media = media.trim_ascii();
+        if onload || media.is_empty() || media.eq_ignore_ascii_case("all") {
+            return false;
+        }
+    }
+    // `link[as='style']` also matches a preload, which does not apply its stylesheet.
+    rel.is_some_and(|rel| {
+        (rel.value().split_ascii_whitespace()).any(|token| token.eq_ignore_ascii_case("stylesheet"))
+    })
+}
 
 const SELECTOR_CAP: usize = TAG_HANDLERS.len() + 3;
 

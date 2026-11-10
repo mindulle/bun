@@ -404,6 +404,12 @@ pub mod bv2_impl {
         /// INTERNAL_PREFIX ++ "/asset" = "/_bun/asset".
         pub(crate) const ASSET_PREFIX: &str = "/_bun/asset";
 
+        /// The id of the asset that the dev server serves a stylesheet as:
+        /// `{ASSET_PREFIX}/{id in hex}.css`.
+        pub fn css_asset_id(path: &crate::bun_fs::Path<'_>) -> u64 {
+            bun_wyhash::hash(path.key_for_incremental_graph())
+        }
+
         /// TYPE_ONLY moved
         /// down to bundler (T5); bake (in runtime, T6) constructs values of this type.
         #[derive(Clone)]
@@ -6025,6 +6031,7 @@ pub mod bv2_impl {
                     ),
                     content: chunk::Content::Css(chunk::CssChunk {
                         imports_in_chunk_in_order: order,
+                        of_html_page: None,
                         asts: (0..order_len)
                             .map(|_| bun_css::BundlerStyleSheet::empty())
                             .collect::<Vec<_>>()
@@ -7959,6 +7966,14 @@ pub mod bv2_impl {
             source_index: IndexInt,
             code: Box<[u8]>,
             script_injection_offset: u32,
+            /// Dev server: `(asset, attributes)` of each stylesheet `<link>` of
+            /// the page that has `media` or `disabled`, in document order. The
+            /// asset is `bake_types::css_asset_id` of the stylesheet. The tag
+            /// that the dev server adds for the stylesheet gets the
+            /// attributes. Empty attributes: another `<link>` of the page
+            /// loads the stylesheet of such a `<link>` without them, so the
+            /// dev server also adds its usual tag.
+            css_links: Box<[(u64, Box<[u8]>)]>,
         },
     }
 

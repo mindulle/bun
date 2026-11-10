@@ -1622,7 +1622,7 @@ interface BuildMetafile {
       imports: Array<{ path: string; kind: ImportKind }>;
       exports: string[];
       entryPoint?: string;
-      cssBundle?: string; // Associated CSS file for JS entry points
+      cssBundle?: string; // Associated CSS file for JS entry points. Not set for an HTML page that links a stylesheet with `media` or `disabled`
     };
   };
 }

@@ -1,4 +1,7 @@
-import { describe, expect } from "bun:test";
+import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe, tempDir } from "harness";
+import { readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { itBundled } from "./expectBundled";
 
 describe("bundler", () => {
@@ -1129,6 +1132,430 @@ body {
         entry: `@media print{@layer a;}` + rest,
       });
     },
+  });
+
+  // The page with its hashes replaced, and the CSS of each CSS file that a `<link>` of the page loads, in document order.
+  const pageAndStylesheets = (api: { readFile(path: string): string }, page: string) => {
+    const html = api.readFile("out/" + page);
+    return {
+      html: html.replace(/-[a-z0-9]{8}\./g, "-[hash]."),
+      css: [...html.matchAll(/<link\b[^>]*\bhref="(\.[^"]+\.css)"[^>]*>/g)].map(([, file]) =>
+        api.readFile(join("out", dirname(page), file)),
+      ),
+    };
+  };
+
+  // https://github.com/oven-sh/bun/issues/18526
+  itBundled("html/LinkWithMediaGetsItsOwnCssFile", {
+    outdir: "out/",
+    minifyWhitespace: true,
+    files: {
+      "/index.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./screen.css">
+    <link rel="stylesheet" type="text/css" href="./print.css" media="print" />
+  </head>
+  <body><script type="module" src="./app.js"></script></body>
+</html>`,
+      "/screen.css": `body { color: red }`,
+      "/print.css": `body { color: black }`,
+      "/app.js": `console.log(1)`,
+    },
+    entryPoints: ["/index.html"],
+    onAfterBundle(api) {
+      // The print rules are in a file of their own, and the tag that loads it has `media="print"`.
+      expect(pageAndStylesheets(api, "index.html")).toEqual({
+        html: `<!doctype html>
+<html>
+  <head>
+    
+    
+  <link rel="stylesheet" crossorigin href="./index-[hash].css"><link rel="stylesheet" type="text/css" media="print" crossorigin href="./index-[hash].css"><script type="module" crossorigin src="./index-[hash].js"></script></head>
+  <body></body>
+</html>
+`,
+        css: [`body{color:red}\n`, `body{color:#000}\n`],
+      });
+    },
+  });
+
+  // The CSS tags are where the one CSS tag of any other page is, in the order that the page loads its stylesheets in.
+  itBundled("html/LinksWithMediaKeepTheCascadeOrder", {
+    outdir: "out/",
+    minifyWhitespace: true,
+    files: {
+      "/index.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./a.css">
+    <style>.inline { color: red }</style>
+    <link rel="stylesheet" href="https://cdn.example.com/framework.css" media="print">
+    <link rel="stylesheet" href="./print.css" media="print" id="print" integrity="sha384-AAAA" data-label='the "print" one'>
+    <script>window.printLink = document.getElementById("print")</script>
+    <script type="module" src="./app.js"></script>
+    <link rel="stylesheet" href="./b.css">
+  </head>
+  <body>
+    <link rel="stylesheet" href="./dark.css" disabled crossorigin="use-credentials">
+    <link rel="stylesheet" href="./c.css">
+  </body>
+</html>`,
+      "/a.css": `.a { color: red }`,
+      "/print.css": `.print { color: black }`,
+      "/from-script.css": `.from-script { color: red }`,
+      "/b.css": `.b { color: red }`,
+      "/dark.css": `.dark { color: black }`,
+      "/c.css": `.c { color: red }`,
+      "/app.js": `import "./from-script.css";\nimport "./a.css";`,
+    },
+    entryPoints: ["/index.html"],
+    onAfterBundle(api) {
+      expect(pageAndStylesheets(api, "index.html")).toEqual({
+        // The inline style, the inline script and the link that Bun does not bundle stay where they are.
+        // The tags are after them, so the inline script runs before the tag with `id="print"` exists.
+        // That tag has no `integrity`: the author made it for print.css, not for the file that Bun writes.
+        html: `<!doctype html>
+<html>
+  <head>
+    
+    <style>.inline { color: red }</style>
+    <link rel="stylesheet" href="https://cdn.example.com/framework.css" media="print">
+    
+    <script>window.printLink = document.getElementById("print")</script>
+    
+    
+  <link rel="stylesheet" crossorigin href="./index-[hash].css"><link rel="stylesheet" media="print" id="print" data-label="the &quot;print&quot; one" crossorigin href="./index-[hash].css"><link rel="stylesheet" crossorigin href="./index-[hash].css"><link rel="stylesheet" disabled crossorigin="use-credentials" href="./index-[hash].css"><link rel="stylesheet" crossorigin href="./index-[hash].css"><script type="module" crossorigin src="./index-[hash].js"></script></head>
+  <body>
+    
+    
+  </body>
+</html>
+`,
+        css: [
+          `.a{color:red}\n`,
+          `.print{color:#000}\n`,
+          // What the script and the next link load. The first link already loaded a.css.
+          `.from-script{color:red}.b{color:red}\n`,
+          `.dark{color:#000}\n`,
+          `.c{color:red}\n`,
+        ],
+      });
+    },
+  });
+
+  itBundled("html/SameStylesheetLinkedWithTwoMedia", {
+    outdir: "out/",
+    minifyWhitespace: true,
+    files: {
+      "/index.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./theme.css" media="print">
+    <link rel="stylesheet" as="style" href="./theme.css" media="(max-width: 600px)">
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body></body>
+</html>`,
+      "/theme.css": `.theme { color: red }`,
+      "/app.js": `import "./theme.css";`,
+    },
+    entryPoints: ["/index.html"],
+    onAfterBundle(api) {
+      const html = api.readFile("out/index.html");
+      const files = [...html.matchAll(/href="\.\/(index-[a-z0-9]{8}\.css)"/g)].map(([, file]) => file);
+      expect({ page: pageAndStylesheets(api, "index.html"), files }).toEqual({
+        page: {
+          html: `<!doctype html>
+<html>
+  <head>
+    
+    
+    
+  <link rel="stylesheet" media="print" crossorigin href="./index-[hash].css"><link rel="stylesheet" as="style" media="(max-width: 600px)" crossorigin href="./index-[hash].css"><link rel="stylesheet" crossorigin href="./index-[hash].css"><script type="module" crossorigin src="./index-[hash].js"></script></head>
+  <body></body>
+</html>
+`,
+          css: Array(3).fill(`.theme{color:red}\n`),
+        },
+        // The two links load one file. The import of the script has no media, so it is in another file.
+        files: [files[0], files[0], files[2]],
+      });
+      expect(files[2]).not.toBe(files[0]);
+    },
+  });
+
+  // These change nothing: a `media` that matches everything (the browser takes the first of two), a link that
+  // Bun does not bundle, a preload, and a link that changes its own `media` when its stylesheet has loaded.
+  itBundled("html/LinkWithMediaAllIsMerged", {
+    outdir: "out/",
+    minifyWhitespace: true,
+    files: {
+      "/index.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="https://cdn.example.com/print.css" media="print">
+    <link rel="stylesheet" href="./a.css" media="">
+    <link rel="stylesheet" href="./b.css" media=" ALL ">
+    <link rel="preload" as="style" href="./c.css" media="print">
+    <link rel="stylesheet" href="./d.css" media="print" onload="this.media='all'">
+    <link rel="stylesheet" href="./e.css" media="all" media="print">
+    <link rel="stylesheet" href="./f.css">
+  </head>
+  <body></body>
+</html>`,
+      "/a.css": `.a { color: red }`,
+      "/b.css": `.b { color: red }`,
+      "/c.css": `.c { color: red }`,
+      "/d.css": `.d { color: red }`,
+      "/e.css": `.e { color: red }`,
+      "/f.css": `.f { color: red }`,
+    },
+    entryPoints: ["/index.html"],
+    onAfterBundle(api) {
+      expect(pageAndStylesheets(api, "index.html")).toEqual({
+        html: `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="https://cdn.example.com/print.css" media="print">
+    
+    
+    
+    
+    
+    
+  <link rel="stylesheet" crossorigin href="./index-[hash].css"><script type="module" crossorigin src="./index-[hash].js"></script></head>
+  <body></body>
+</html>
+`,
+        css: [`.a{color:red}.b{color:red}.c{color:red}.d{color:red}.e{color:red}.f{color:red}\n`],
+      });
+    },
+  });
+
+  // The CSS files of one page have the name of the page. Without `[hash]` each one after the first gets a number.
+  itBundled("html/CssFilesOfAPageWithoutHashInTheName", {
+    outdir: "out/",
+    minifyWhitespace: true,
+    chunkNaming: "[name].[ext]",
+    files: {
+      "/index.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./index.css">
+    <link rel="stylesheet" href="./print.css" media="print">
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body></body>
+</html>`,
+      // The CSS file of this page has the first name that a number would give.
+      "/index-2.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./other.css">
+  </head>
+  <body></body>
+</html>`,
+      "/index.css": `body { color: red }`,
+      "/print.css": `body { color: black }`,
+      "/from-script.css": `.from-script { color: red }`,
+      "/other.css": `.other { color: red }`,
+      "/app.js": `import "./from-script.css";`,
+    },
+    entryPoints: ["/index.html", "/index-2.html"],
+    onAfterBundle(api) {
+      expect([pageAndStylesheets(api, "index.html"), pageAndStylesheets(api, "index-2.html")]).toEqual([
+        {
+          html: `<!doctype html>
+<html>
+  <head>
+    
+    
+    
+  <link rel="stylesheet" crossorigin href="./index.css"><link rel="stylesheet" media="print" crossorigin href="./index-3.css"><link rel="stylesheet" crossorigin href="./index-4.css"><script type="module" crossorigin src="./index.js"></script></head>
+  <body></body>
+</html>
+`,
+          css: [`body{color:red}\n`, `body{color:#000}\n`, `.from-script{color:red}\n`],
+        },
+        {
+          html: `<!doctype html>
+<html>
+  <head>
+    
+  <link rel="stylesheet" crossorigin href="./index-2.css"><script type="module" crossorigin src="./index-2.js"></script></head>
+  <body></body>
+</html>
+`,
+          css: [`.other{color:red}\n`],
+        },
+      ]);
+    },
+  });
+
+  // Two CSS files of a page with the same bytes are still two files.
+  itBundled("html/CssFilesOfAPageWithTheSameBytes", {
+    outdir: "out/",
+    minifyWhitespace: true,
+    files: {
+      "/index.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./screen.css">
+    <link rel="stylesheet" href="./print.css" media="print">
+    <link rel="stylesheet" href="./small.css" media="(max-width: 600px)">
+  </head>
+  <body></body>
+</html>`,
+      "/screen.css": ``,
+      "/print.css": ``,
+      "/small.css": ``,
+    },
+    entryPoints: ["/index.html"],
+    onAfterBundle(api) {
+      const files = [...api.readFile("out/index.html").matchAll(/href="\.\/(index-[a-z0-9]{8}\.css)"/g)].map(
+        ([, file]) => file,
+      );
+      expect({ files: new Set(files).size, css: files.map(file => api.readFile("out/" + file)) }).toEqual({
+        files: 3,
+        css: ["", "", ""],
+      });
+    },
+  });
+
+  // Two pages that each link a stylesheet of their own with `media`. The two stylesheets have the same bytes.
+  // The name has no `[name]`, so only the hash tells the CSS files of the two pages apart.
+  itBundled("html/TwoPagesWithMediaLinksToTheSameBytes", {
+    outdir: "out/",
+    minifyWhitespace: true,
+    chunkNaming: "chunk-[hash].[ext]",
+    files: {
+      "/a.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./a/style.css">
+    <link rel="stylesheet" href="./a/print.css" media="print">
+  </head>
+  <body></body>
+</html>`,
+      "/b.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./b/style.css">
+    <link rel="stylesheet" href="./b/print.css" media="print">
+  </head>
+  <body></body>
+</html>`,
+      "/a/style.css": `.a { color: red }`,
+      "/b/style.css": `.b { color: red }`,
+      "/a/print.css": `body { color: black }`,
+      "/b/print.css": `body { color: black }`,
+    },
+    entryPoints: ["/a.html", "/b.html"],
+    onAfterBundle(api) {
+      expect([pageAndStylesheets(api, "a.html").css, pageAndStylesheets(api, "b.html").css]).toEqual([
+        [`.a{color:red}\n`, `body{color:#000}\n`],
+        [`.b{color:red}\n`, `body{color:#000}\n`],
+      ]);
+      const files = ["a.html", "b.html"].flatMap(page => api.readFile("out/" + page).match(/chunk-[a-z0-9]{8}\.css/g));
+      expect(new Set(files).size).toBe(4);
+    },
+  });
+
+  // A page with such a link does not change the CSS file of another page or of a CSS entry point, in either order.
+  for (const entryPoints of [
+    ["/plain.html", "/print.css", "/with-media.html"],
+    ["/with-media.html", "/print.css", "/plain.html"],
+  ]) {
+    itBundled(`html/PageWithMediaLinkDoesNotChangeOtherEntryPoints/${entryPoints[0].slice(1)}-first`, {
+      outdir: "out/",
+      production: true,
+      files: {
+        "/plain.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body></body>
+</html>`,
+        "/with-media.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./style.css">
+    <link rel="stylesheet" href="./print.css" media="print">
+  </head>
+  <body></body>
+</html>`,
+        "/style.css": `body { color: red }`,
+        "/print.css": `body { color: black }`,
+      },
+      entryPoints,
+      onAfterBundle(api) {
+        const tags = (page: string) =>
+          api
+            .readFile("out/" + page)
+            .match(/<link[^>]*>/g)!
+            .map(tag => tag.replace(/-[a-z0-9]{8}\./g, "-[hash]."));
+        expect({
+          plain: tags("plain.html"),
+          withMedia: tags("with-media.html"),
+          css: [
+            pageAndStylesheets(api, "plain.html").css,
+            pageAndStylesheets(api, "with-media.html").css,
+            api.readFile("out/print.css"),
+          ],
+        }).toEqual({
+          plain: [`<link rel="stylesheet" crossorigin href="./plain-[hash].css">`],
+          withMedia: [
+            `<link rel="stylesheet" crossorigin href="./with-media-[hash].css">`,
+            `<link rel="stylesheet" media="print" crossorigin href="./with-media-[hash].css">`,
+          ],
+          css: [[`body{color:red}\n`], [`body{color:red}\n`, `body{color:#000}\n`], `body{color:#000}\n`],
+        });
+      },
+    });
+  }
+
+  // The hash in the name of a page follows the order of its CSS files, so that order must not depend on where the files are.
+  test("html/CssFilesOfAPageHaveTheSameNamesInAnotherDirectory", async () => {
+    const files = {
+      "index.html": `<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./a.css">
+    <link rel="stylesheet" href="./print.css" media="print">
+    <link rel="stylesheet" href="./dark.css" disabled>
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body></body>
+</html>`,
+      "a.css": `.a { color: red }`,
+      "print.css": `.print { color: black }`,
+      "dark.css": `.dark { color: black }`,
+      "from-script.css": `.from-script { color: red }`,
+      "app.js": `import "./from-script.css";`,
+    };
+    const builds = await Promise.all(
+      ["html-media-names", "html-media-names-in-another-directory"].map(async prefix => {
+        using dir = tempDir(prefix, files);
+        await using proc = Bun.spawn({
+          cmd: [bunExe(), "build", "./index.html", "--outdir=out", "--entry-naming=[name]-[hash].[ext]", "--minify"],
+          cwd: String(dir),
+          env: bunEnv,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        return { names: exitCode === 0 ? readdirSync(join(String(dir), "out")).sort() : stderr, exitCode };
+      }),
+    );
+    const [first, second] = builds;
+    // On a failure, `names` is what the build printed.
+    expect({
+      css: Array.isArray(first.names) ? first.names.filter(name => name.endsWith(".css")).length : first.names,
+      exitCode: first.exitCode,
+    }).toEqual({ css: 4, exitCode: 0 });
+    expect(second).toEqual(first);
   });
 
   // Test manifest.json is copied as an asset and link href is rewritten

@@ -1,6 +1,6 @@
 use crate::mal_prelude::*;
 use bun_alloc::Arena;
-use bun_ast::ImportRecord;
+use bun_ast::{ImportRecord, ImportRecordFlags};
 use bun_collections::VecExt;
 
 use crate::{Index, LinkerContext};
@@ -35,7 +35,19 @@ pub(crate) fn find_imported_css_files_in_js_order(
     }
     let mut visited = BitSet::init_empty(this.graph.files.len()).expect("oom");
     let mut order: Vec<Index> = Vec::new();
+    visit_in_js_order(this, entry_point, entry_point, &mut visited, &mut order);
+    order
+}
 
+/// The traversal of `find_imported_css_files_in_js_order`, from `start`. It
+/// adds to `order` each CSS file that it reaches and that is not `visited`.
+fn visit_in_js_order(
+    this: &LinkerContext,
+    entry_point: Index,
+    start: Index,
+    visited: &mut BitSet,
+    order: &mut Vec<Index>,
+) {
     let all_import_records = this.graph.ast.items_import_records();
     let all_loaders = this.parse_graph().input_files.items_loader();
     let all_parts = this.graph.ast.items_parts();
@@ -48,7 +60,7 @@ pub(crate) fn find_imported_css_files_in_js_order(
         Enter(Index),
         Leave(Index),
     }
-    let mut stack: Vec<Frame> = vec![Frame::Enter(entry_point)];
+    let mut stack: Vec<Frame> = vec![Frame::Enter(start)];
 
     while let Some(frame) = stack.pop() {
         let source_index = match frame {
@@ -93,6 +105,52 @@ pub(crate) fn find_imported_css_files_in_js_order(
         }
         stack[mark..].reverse();
     }
+}
 
-    order
+/// The CSS chunks of an HTML page that has a stylesheet `<link>` with `media`
+/// or `disabled` (`ImportRecordFlags::HTML_LINK_CONDITIONAL`), in cascade
+/// order. `None` for every other page.
+///
+/// The stylesheet of such a link gets a chunk of its own: `(Some(the import
+/// record of the link), [the stylesheet])`. That chunk cuts the order of
+/// `find_imported_css_files_in_js_order` in two: `(None, stylesheets)` is the
+/// CSS that the page's other links and its scripts load between two cuts.
+pub(crate) fn find_css_chunks_of_html_page(
+    this: &LinkerContext,
+    page: Index,
+) -> Option<Vec<(Option<u32>, Vec<Index>)>> {
+    let records: &[ImportRecord] =
+        this.graph.ast.items_import_records()[page.get() as usize].as_slice();
+    let loaders = this.parse_graph().input_files.items_loader();
+    let is_conditional = |record: &ImportRecord| {
+        record
+            .flags
+            .contains(ImportRecordFlags::HTML_LINK_CONDITIONAL)
+            && record.source_index.is_valid()
+            && loaders[record.source_index.get() as usize].is_css()
+    };
+    if !records.iter().any(is_conditional) {
+        return None;
+    }
+
+    let mut chunks: Vec<(Option<u32>, Vec<Index>)> = Vec::new();
+    let mut between: Vec<Index> = Vec::new();
+    let mut visited = BitSet::init_empty(this.graph.files.len()).expect("oom");
+    visited.set(page.get() as usize);
+    for (record_index, record) in records.iter().enumerate() {
+        if is_conditional(record) {
+            if !between.is_empty() {
+                chunks.push((None, core::mem::take(&mut between)));
+            }
+            // Not `visited`: another link or a script that loads this
+            // stylesheet applies it whatever this link says.
+            chunks.push((Some(record_index as u32), vec![record.source_index]));
+        } else if record.source_index.is_valid() {
+            visit_in_js_order(this, page, record.source_index, &mut visited, &mut between);
+        }
+    }
+    if !between.is_empty() {
+        chunks.push((None, between));
+    }
+    Some(chunks)
 }

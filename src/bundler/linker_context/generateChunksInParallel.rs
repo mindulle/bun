@@ -37,6 +37,26 @@ use crate::bytecode_sidecar::EXTENSION as BYTECODE_EXTENSION;
 // below move the boxed buffer directly — no lifetime promotion needed.
 use crate::linker_context_mod::debug;
 
+/// The output path that `template` prints, with `/` separators.
+fn print_rel_path(template: &options::PathTemplate, sanitize: bool) -> Vec<u8> {
+    let mut rel_path: Vec<u8> = Vec::new();
+    // Use the byte-writer (`PathTemplate::print`) directly —
+    // routing through `Display`/`write!` goes via `from_utf8_lossy`,
+    // which would replace non-UTF-8 dir bytes with U+FFFD and corrupt
+    // the output path.
+    template
+        .print(&mut rel_path, sanitize)
+        .expect("write to Vec<u8>");
+    path::resolve_path::platform_to_posix_in_place::<u8>(&mut rel_path);
+
+    // A `./[dir]/…` template with `[dir] == "."` yields `././x.js`,
+    // which importers of the chunk would copy verbatim.
+    while let Some(i) = strings::index_of(&rel_path, b"/./") {
+        rel_path.drain(i..i + 2);
+    }
+    rel_path
+}
+
 // Const generics cannot vary the return type, so we always return
 // `Vec<OutputFile>` and the IS_DEV_SERVER path returns an empty Vec.
 pub(crate) fn generate_chunks_in_parallel<'a, const IS_DEV_SERVER: bool>(
@@ -381,23 +401,30 @@ pub(crate) fn generate_chunks_in_parallel<'a, const IS_DEV_SERVER: bool>(
             let chunk = &mut chunks[index];
             chunk.template.placeholder.hash = Some(hashes[index]);
 
-            let mut rel_path: Vec<u8> = Vec::new();
-            // Use the byte-writer (`PathTemplate::print`) directly —
-            // routing through `Display`/`write!` goes via `from_utf8_lossy`,
-            // which would replace non-UTF-8 dir bytes with U+FFFD and corrupt
-            // the output path.
             // Disk output sanitizes leading `..`; `--compile` keeps it so
             // runtime bunfs references to out-of-root entrypoints resolve.
-            chunk
-                .template
-                .print(&mut rel_path, !c.options.compile_mode.is_executable())
-                .expect("write to Vec<u8>");
-            path::resolve_path::platform_to_posix_in_place::<u8>(&mut rel_path);
+            let sanitize = !c.options.compile_mode.is_executable();
+            let mut rel_path = print_rel_path(&chunk.template, sanitize);
 
-            // A `./[dir]/…` template with `[dir] == "."` yields `././x.js`,
-            // which importers of the chunk would copy verbatim.
-            while let Some(i) = strings::index_of(&rel_path, b"/./") {
-                rel_path.drain(i..i + 2);
+            // The CSS chunks of an HTML page that has several have the name of
+            // the page. Without `[hash]`, each one after the first gets a
+            // number: the first number that gives a path no chunk has yet.
+            if let crate::chunk::Content::Css(css) = &chunk.content
+                && css.of_html_page.is_some_and(|page| page.nth > 1)
+                && !chunk.template.needs(options::PlaceholderField::Hash)
+            {
+                let page_name = core::mem::take(&mut chunk.template.placeholder.name);
+                let mut number: u32 = 1;
+                loop {
+                    number += 1;
+                    let mut name = page_name.to_vec();
+                    write!(&mut name, "-{number}").expect("write to Vec<u8>");
+                    chunk.template.placeholder.name = name.into_boxed_slice();
+                    rel_path = print_rel_path(&chunk.template, sanitize);
+                    if !path_names_map.contains_key(&rel_path[..]) {
+                        break;
+                    }
+                }
             }
 
             let input: &[u8] = c.parse_graph().input_files.items_source()
@@ -845,6 +872,25 @@ pub(crate) fn generate_chunks_in_parallel<'a, const IS_DEV_SERVER: bool>(
                     buffer = buf.into_boxed_slice();
                 }
                 SourceMapOption::None => {}
+            }
+
+            // The stylesheet of an HTML `<link>` with `media` or `disabled` stays
+            // the `href` of a `<link>` that has those attributes.
+            if let crate::chunk::Content::Css(css) = &chunks[ci].content
+                && css.of_html_page.is_some_and(|page| page.is_link)
+            {
+                let url =
+                    bun_resolver::DataURL::encode_string_as_shortest_data_url(b"text/css", &buffer);
+                // The URL goes between the double quotes of the attribute.
+                let mut href: Vec<u8> = Vec::with_capacity(url.len());
+                for &byte in &url {
+                    match byte {
+                        b'"' => href.extend_from_slice(b"&quot;"),
+                        b'&' => href.extend_from_slice(b"&amp;"),
+                        byte => href.push(byte),
+                    }
+                }
+                buffer = href.into_boxed_slice();
             }
 
             chunks[ci].final_output_size = buffer.len();

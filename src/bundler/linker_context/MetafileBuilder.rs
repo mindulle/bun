@@ -175,10 +175,11 @@ fn generate_chunk_json(
         }
     }
 
-    // Write cssBundle if this JS chunk has associated CSS
+    // Write cssBundle if this JS chunk has associated CSS. An HTML page with
+    // `html_css_tags` has several CSS chunks, and a tag decides when each applies.
     if let ChunkContent::Javascript(js) = &chunk.content {
         let css_chunks = &js.css_chunks;
-        if !css_chunks.is_empty() {
+        if !css_chunks.is_empty() && js.html_css_tags.is_empty() {
             // Get the first CSS chunk path
             let css_chunk_index = css_chunks[0];
             if (css_chunk_index as usize) < chunks.len() {

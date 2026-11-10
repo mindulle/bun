@@ -10,6 +10,7 @@ use lol_html::HandlerResult;
 use lol_html::html_content::{ContentType, Element, EndTag};
 
 use crate::HTMLScanner::{HTMLProcessor, HTMLProcessorHandler};
+use crate::chunk;
 use crate::linker_context_mod::{GenerateChunkCtx, LinkerContext, debug};
 use crate::options::Loader;
 use crate::{Chunk, CompileResult};
@@ -28,7 +29,9 @@ use crate::{Chunk, CompileResult};
 ///    to point to the JavaScript chunk's unique key.
 /// 4. If a CSS chunk exists, add a <link rel="stylesheet" href="..." crossorigin> tag that contains
 ///    the CSS for the entry point which uses the "href" attribute to point to the
-///    CSS chunk's unique key.
+///    CSS chunk's unique key. A page that has a stylesheet <link> with `media` or
+///    `disabled` has more than one CSS chunk, and the tag of the chunk of such a
+///    <link> has the attributes of that <link> (`JavaScriptChunk::html_css_tags`).
 /// 5. For each imported module or chunk within the JavaScript code, add
 ///    a <link rel="modulepreload" href="..." crossorigin> tag that
 ///    points to the module or chunk's unique key so that we tell the
@@ -81,11 +84,56 @@ struct HTMLLoader<'a> {
     /// This task's HTML chunk, an element of `chunks`.
     chunk: &'a Chunk<'a>,
     chunks: &'a [Chunk<'a>],
+    /// This page's `JavaScriptChunk::html_css_tags` and the `css_chunks` that
+    /// they index. Empty for the dev server, which links each stylesheet.
+    css_tags: &'a [chunk::HtmlCssTag],
+    css_chunks: &'a [u32],
+    /// `(import record, attributes)` of each stylesheet `<link>` with `media`
+    /// or `disabled` that this pass removed.
+    conditional_links: Vec<(u32, String)>,
+    /// Where the head tags go, for a page with `css_tags`. They are added
+    /// after the pass, because a `<link>` that one of them needs can follow
+    /// this point.
+    head_tags_offset: Option<usize>,
     compile_to_standalone_html: bool,
     output: Vec<u8>,
     end_tag_indices: EndTagIndices,
     added_head_tags: bool,
     added_body_script: bool,
+}
+
+/// The attributes of a stylesheet `<link>`, for the tag that links the CSS
+/// chunk of that stylesheet in its place: all of them but `href`, and but
+/// `integrity`, which the author made for the stylesheet and not for the chunk.
+fn link_attributes(link: &Element<'_, '_>, add_crossorigin: bool) -> String {
+    let mut attributes = String::new();
+    let mut has_crossorigin = false;
+    for attribute in link.attributes() {
+        let name = attribute.name();
+        match name.as_str() {
+            "href" | "integrity" => continue,
+            "crossorigin" => has_crossorigin = true,
+            _ => {}
+        }
+        attributes.push(' ');
+        attributes.push_str(&name);
+        // The value is the text of the source, character references included.
+        let value = attribute.value();
+        if !value.is_empty() {
+            attributes.push_str("=\"");
+            for c in value.chars() {
+                match c {
+                    '"' => attributes.push_str("&quot;"),
+                    c => attributes.push(c),
+                }
+            }
+            attributes.push('"');
+        }
+    }
+    if add_crossorigin && !has_crossorigin {
+        attributes.push_str(" crossorigin");
+    }
+    attributes
 }
 
 /// `Element::set_attribute` takes `&str`, so non-UTF-8 `name`/`value` bytes
@@ -98,6 +146,16 @@ fn set_attribute(element: &mut Element<'_, '_>, name: &[u8], value: &[u8]) {
     if !ok {
         panic!("unexpected error from Element.setAttribute");
     }
+}
+
+/// `record` is a stylesheet `<link>` with `media` or `disabled`, and its
+/// stylesheet is in the bundle.
+fn is_conditional_stylesheet_link(record: &ImportRecord, loader: Loader) -> bool {
+    record
+        .flags
+        .contains(ImportRecordFlags::HTML_LINK_CONDITIONAL)
+        // The dev server does not load again a stylesheet that did not change.
+        && (loader.is_css() || record.path.is_disabled)
 }
 
 impl<'a> HTMLProcessorHandler for HTMLLoader<'a> {
@@ -127,8 +185,8 @@ impl<'a> HTMLProcessorHandler for HTMLLoader<'a> {
             ));
         }
 
-        let import_record: &ImportRecord =
-            &self.import_records[self.current_import_record_index as usize];
+        let import_record_index = self.current_import_record_index;
+        let import_record: &ImportRecord = &self.import_records[import_record_index as usize];
         self.current_import_record_index += 1;
 
         let parse_graph = self.linker.parse_graph();
@@ -163,6 +221,11 @@ impl<'a> HTMLProcessorHandler for HTMLLoader<'a> {
                 || loader.is_javascript_like()
                 || loader.is_css()
             {
+                if is_conditional_stylesheet_link(import_record, loader) {
+                    // The dev server makes the tag: see `CompileResult::Html::css_links`.
+                    self.conditional_links
+                        .push((import_record_index, link_attributes(element, false)));
+                }
                 element.remove();
             } else {
                 set_attribute(element, url_attribute, import_record.path.pretty);
@@ -179,6 +242,12 @@ impl<'a> HTMLProcessorHandler for HTMLLoader<'a> {
         }
 
         if loader.is_javascript_like() || loader.is_css() {
+            if is_conditional_stylesheet_link(import_record, loader) {
+                self.conditional_links.push((
+                    import_record_index,
+                    link_attributes(element, !self.compile_to_standalone_html),
+                ));
+            }
             // Remove the original non-external tags
             element.remove();
             return;
@@ -246,6 +315,11 @@ impl<'a> HTMLLoader<'a> {
         }
         self.added_head_tags = true;
 
+        if !self.css_tags.is_empty() {
+            self.head_tags_offset = Some(self.output.len());
+            return;
+        }
+
         let tags = self.get_head_tags();
         for tag in &tags {
             end_tag.before(tag, ContentType::Html);
@@ -274,24 +348,51 @@ impl<'a> HTMLLoader<'a> {
         ))
     }
 
+    /// The tag that links `css_chunk`, or that holds it in standalone HTML.
+    /// `link_attributes`: the chunk is the stylesheet of a `<link>` with
+    /// `media` or `disabled`, and these are the attributes of that `<link>`.
+    fn css_tag(&self, css_chunk: &Chunk, link_attributes: Option<&str>) -> String {
+        let key = BStr::new(css_chunk.unique_key);
+        match link_attributes {
+            // In standalone HTML, the key of such a chunk becomes a `data:` URL.
+            Some(attributes) => format!("<link{attributes} href=\"{key}\">"),
+            None if self.compile_to_standalone_html => format!("<style>{key}</style>"),
+            None => format!("<link rel=\"stylesheet\" crossorigin href=\"{key}\">"),
+        }
+    }
+
+    fn add_css_tags(&self, array: &mut Vec<String>) {
+        if self.css_tags.is_empty() {
+            if let Some(css_chunk) = self.chunk.get_css_chunk_for_html(self.chunks) {
+                array.push(self.css_tag(css_chunk, None));
+            }
+            return;
+        }
+        for tag in self.css_tags {
+            let link_attributes = tag.link.map(|link| {
+                let (_, attributes) = (self.conditional_links.iter())
+                    .find(|(record, _)| *record == link)
+                    .expect("the pass removed the <link> of each CSS chunk");
+                attributes.as_str()
+            });
+            let css_chunk = &self.chunks[self.css_chunks[tag.css_chunk as usize] as usize];
+            let tag = self.css_tag(css_chunk, link_attributes);
+            // One `<link>` can match two rows of `TAG_HANDLERS`. It then has
+            // two import records, and one tag is enough.
+            if link_attributes.is_none() || array.last() != Some(&tag) {
+                array.push(tag);
+            }
+        }
+    }
+
     fn get_head_tags(&self) -> Vec<String> {
         let mut array: Vec<String> = Vec::with_capacity(2);
         if self.compile_to_standalone_html {
             // In standalone HTML mode, only put CSS in <head>; JS goes before </body>
-            if let Some(css_chunk) = self.chunk.get_css_chunk_for_html(self.chunks) {
-                array.push(format!(
-                    "<style>{}</style>",
-                    BStr::new(css_chunk.unique_key)
-                ));
-            }
+            self.add_css_tags(&mut array);
         } else {
             // Put CSS before JS to reduce chances of flash of unstyled content
-            if let Some(css_chunk) = self.chunk.get_css_chunk_for_html(self.chunks) {
-                array.push(format!(
-                    "<link rel=\"stylesheet\" crossorigin href=\"{}\">",
-                    BStr::new(css_chunk.unique_key)
-                ));
-            }
+            self.add_css_tags(&mut array);
             if let Some(js_chunk_index) = self.chunk.get_js_chunk_index_for_html(self.chunks) {
                 // type="module" scripts do not block rendering, so it is okay to put them in head
                 array.push(format!(
@@ -388,6 +489,20 @@ fn generate_compile_result_for_html_chunk_impl<'a>(
     let records = import_records[source_index as usize].as_slice();
 
     let _ = (source_index, log, minify_whitespace);
+    let mut css_tags: &[chunk::HtmlCssTag] = &[];
+    let mut css_chunks: &[u32] = &[];
+    if !has_dev_server
+        && (records.iter()).any(|record| {
+            record
+                .flags
+                .contains(ImportRecordFlags::HTML_LINK_CONDITIONAL)
+        })
+        && let Some(js_chunk) = chunk.get_js_chunk_for_html(chunks)
+        && let chunk::Content::Javascript(js) = &js_chunk.content
+    {
+        css_tags = &js.html_css_tags;
+        css_chunks = &js.css_chunks;
+    }
     let mut html_loader = HTMLLoader {
         linker: c,
         import_records: records,
@@ -395,6 +510,10 @@ fn generate_compile_result_for_html_chunk_impl<'a>(
         compile_to_standalone_html,
         chunk,
         chunks,
+        css_tags,
+        css_chunks,
+        conditional_links: Vec::new(),
+        head_tags_offset: None,
         output: Vec::new(),
         end_tag_indices: EndTagIndices {
             html: None,
@@ -407,6 +526,11 @@ fn generate_compile_result_for_html_chunk_impl<'a>(
 
     HTMLProcessor::<HTMLLoader, true>::run(&mut html_loader, contents)
         .unwrap_or_else(|_| panic!("unexpected error from HTMLProcessor.run"));
+
+    if let Some(offset) = html_loader.head_tags_offset {
+        let tags = html_loader.get_head_tags().concat().into_bytes();
+        drop(html_loader.output.splice(offset..offset, tags));
+    }
 
     // There are some cases where invalid HTML will make it so </head> is
     // never emitted, even if the literal text DOES appear. These cases are
@@ -455,9 +579,51 @@ fn generate_compile_result_for_html_chunk_impl<'a>(
         }
     };
 
+    // The dev server links each stylesheet of the page where `script_injection_offset`
+    // is. It needs the attributes for the ones that a `<link>` with `media` or
+    // `disabled` loads.
+    let mut css_links: Vec<(u64, Box<[u8]>)> = Vec::new();
+    if has_dev_server && !html_loader.conditional_links.is_empty() {
+        let asset_of = |record: &ImportRecord| {
+            crate::bake_types::css_asset_id(if record.source_index.is_valid() {
+                &sources[record.source_index.get() as usize].path
+            } else {
+                &record.path
+            })
+        };
+        for (record, attributes) in &html_loader.conditional_links {
+            let link: (u64, Box<[u8]>) = (
+                asset_of(&records[*record as usize]),
+                attributes.as_bytes().into(),
+            );
+            // One `<link>` can match two rows of `TAG_HANDLERS`.
+            if css_links.last() != Some(&link) {
+                css_links.push(link);
+            }
+        }
+        // A stylesheet that another `<link>` of the page loads too, without
+        // `media` and `disabled`, applies whatever the first `<link>` says.
+        let conditional = css_links.len();
+        for record in records {
+            if record.kind != ImportKind::At
+                || (record.flags).contains(ImportRecordFlags::HTML_LINK_CONDITIONAL)
+                || (record.flags).contains(ImportRecordFlags::IS_EXTERNAL_WITHOUT_SIDE_EFFECTS)
+            {
+                continue;
+            }
+            let asset = asset_of(record);
+            if css_links[..conditional].iter().any(|(id, _)| *id == asset)
+                && !css_links[conditional..].iter().any(|(id, _)| *id == asset)
+            {
+                css_links.push((asset, Box::default()));
+            }
+        }
+    }
+
     CompileResult::Html {
         code: html_loader.output.into_boxed_slice(),
         source_index,
         script_injection_offset,
+        css_links: css_links.into_boxed_slice(),
     }
 }

@@ -419,7 +419,7 @@ pub mod html_import_manifest {
 }
 
 /// The manifest's `input` / asset-key form of a source path: root-relative, `/`-separated.
-fn source_path_relative_to_root<'b>(
+pub(crate) fn source_path_relative_to_root<'b>(
     buf: &'b mut Vec<u8>,
     root_dir: &[u8],
     path: &[u8],

@@ -1887,6 +1887,29 @@ impl<'a> LinkerContext<'a> {
             }
         }
 
+        // An HTML page that has a stylesheet `<link>` with `media` or `disabled`
+        // has several CSS chunks. Two of them can print the same bytes, such
+        // as two empty stylesheets, and each is still a file of its own. So
+        // each mixes in the page that made it and its number on that page.
+        if let crate::chunk::Content::Css(css) = &chunk.content
+            && let Some(of_html_page) = css.of_html_page
+        {
+            let page = &self.parse_graph().input_files.items_source()
+                [chunk.entry_point.source_index() as usize];
+            let root_dir: &[u8] = &self.resolver().opts.root_dir;
+            let mut path: Vec<u8> = Vec::new();
+            hasher.write(crate::HTMLImportManifest::source_path_relative_to_root(
+                &mut path,
+                if root_dir.is_empty() {
+                    bun_resolver::fs::FileSystem::get().top_level_dir()
+                } else {
+                    root_dir
+                },
+                page.path.text,
+            ));
+            hasher.write_ints(&[of_html_page.nth]);
+        }
+
         // Hash the output path template as part of the content hash because we want
         // any import to be considered different if the import's output path has changed.
         hasher.write(&chunk.template.data);

@@ -1,7 +1,7 @@
 // CSS tests concern bundling bugs with CSS files
 import { expect } from "bun:test";
 import assert from "node:assert";
-import { devTest, emptyHtmlFile, imageFixtures } from "../bake-harness";
+import { type Dev, devTest, emptyHtmlFile, imageFixtures } from "../bake-harness";
 
 devTest("css file with syntax error does not kill old styles", {
   files: {
@@ -669,6 +669,163 @@ devTest("changing html file with link tag works", {
     await c.style(".other").color.expect.toBe("red");
     await c.style(".test").color.expect.toBe("#00f");
     await c.style(".test").fontSize.expect.toBe("24px");
+  },
+});
+// The `<link>` tags that the dev server adds to a page, each with the selector of the stylesheet that it loads.
+// They are sorted: the order of the tags is not what these tests are about.
+async function linksOfPage(dev: Dev) {
+  const tags = (await dev.fetch("/").text()).match(/<link\b[^>]*>/g) ?? [];
+  const links = await Promise.all(
+    tags.map(async tag => ({
+      tag: tag.replace(/[a-f0-9]{16}/, "[id]"),
+      selector: (await dev.fetch(tag.match(/href="([^"]+)"/)![1]).text()).match(/^\.[a-z-]+/m)?.[0],
+    })),
+  );
+  return links.sort((a, b) => (a.selector + a.tag).localeCompare(b.selector + b.tag));
+}
+// https://github.com/oven-sh/bun/issues/18526
+devTest("stylesheet link with media keeps its attributes", {
+  files: {
+    "index.html": `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <link rel="stylesheet" href="screen.css">
+          <link rel="stylesheet" href="print.css" media="print" id="print" integrity="sha384-AAAA">
+        </head>
+        <body>
+          <script type="module" src="script.ts"></script>
+        </body>
+      </html>
+    `,
+    "screen.css": `.screen { color: red; }`,
+    "print.css": `.print { color: black; }`,
+    "from-script.css": `.from-script { color: blue; }`,
+    "script.ts": `import "./from-script.css";`,
+  },
+  async test(dev) {
+    const expected = [
+      { tag: `<link rel="stylesheet" href="/_bun/asset/[id].css">`, selector: ".from-script" },
+      // The browser must not check the asset against the hash that the author made for print.css.
+      { tag: `<link rel="stylesheet" media="print" id="print" href="/_bun/asset/[id].css">`, selector: ".print" },
+      { tag: `<link rel="stylesheet" href="/_bun/asset/[id].css">`, selector: ".screen" },
+    ];
+    expect(await linksOfPage(dev)).toEqual(expected);
+
+    await using c = await dev.client("/");
+    // The sheets that show hot-updated CSS, with the media that each one applies for.
+    const hotSheets = () =>
+      c.js<{ media: string; selector: string }[]>`
+        document.adoptedStyleSheets
+          .filter(sheet => !sheet.disabled)
+          .map(sheet => ({ media: sheet.media.mediaText ?? sheet.media, selector: sheet.cssRules[0].selectorText }))
+      `;
+    expect(await hotSheets()).toEqual([]);
+
+    await dev.write("print.css", `.print { color: gray; }`);
+    await c.style(".print").color.expect.toBe("gray");
+    await dev.write("screen.css", `.screen { color: green; }`);
+    await c.style(".screen").color.expect.toBe("green");
+    // The new text of print.css must not apply on screen.
+    expect(await hotSheets()).toEqual([
+      { media: "print", selector: ".print" },
+      { media: "", selector: ".screen" },
+    ]);
+
+    // The stylesheets did not change when the page is bundled again, and the page still links them.
+    await c.expectReload(async () => {
+      await dev.patch("index.html", { find: "<body>", replace: "<body><p>edited</p>" });
+    });
+    expect(await linksOfPage(dev)).toEqual(expected);
+  },
+});
+devTest("stylesheet links with disabled, and with media for a stylesheet that the page also loads without media", {
+  files: {
+    "index.html": `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <link rel="stylesheet" href="theme.css" media="print">
+          <link rel="stylesheet" as="style" href="wide.css" media="(min-width: 900px)">
+          <link rel="stylesheet" href="dark.css" disabled>
+          <link rel="stylesheet" href="both.css" media="print">
+          <link rel="stylesheet" href="both.css">
+        </head>
+        <body>
+          <script type="module" src="script.ts"></script>
+        </body>
+      </html>
+    `,
+    "theme.css": `.theme { color: red; }`,
+    "wide.css": `.wide { color: red; }`,
+    "dark.css": `.dark { color: black; }`,
+    "both.css": `.both { color: red; }`,
+    "script.ts": `import "./theme.css";`,
+  },
+  async test(dev) {
+    expect(await linksOfPage(dev)).toEqual([
+      // Another link loads both.css with no media, so the page also links it that way.
+      { tag: `<link rel="stylesheet" href="/_bun/asset/[id].css">`, selector: ".both" },
+      { tag: `<link rel="stylesheet" media="print" href="/_bun/asset/[id].css">`, selector: ".both" },
+      { tag: `<link rel="stylesheet" disabled href="/_bun/asset/[id].css">`, selector: ".dark" },
+      // The script imports theme.css for every medium, so the page also links it with no media.
+      { tag: `<link rel="stylesheet" href="/_bun/asset/[id].css">`, selector: ".theme" },
+      { tag: `<link rel="stylesheet" media="print" href="/_bun/asset/[id].css">`, selector: ".theme" },
+      // This link matches two rows of the scanner. It still gets one tag.
+      {
+        tag: `<link rel="stylesheet" as="style" media="(min-width: 900px)" href="/_bun/asset/[id].css">`,
+        selector: ".wide",
+      },
+    ]);
+
+    await using c = await dev.client("/");
+    // The sheets that show hot-updated CSS. Each one applies when a link of its stylesheet does.
+    const hotSheets = () =>
+      c.js<{ media: string; disabled: boolean; selector: string }[]>`
+        document.adoptedStyleSheets.map(sheet => ({
+          media: sheet.media.mediaText ?? sheet.media,
+          disabled: sheet.disabled,
+          selector: sheet.cssRules[0].selectorText,
+        }))
+      `;
+    await dev.write("theme.css", `.theme { color: green; }`);
+    await c.style(".theme").color.expect.toBe("green");
+    await dev.write("wide.css", `.wide { color: green; }`);
+    await dev.write("dark.css", `.dark { color: gray; }`);
+    expect(await hotSheets()).toEqual([
+      { media: "", disabled: false, selector: ".theme" },
+      { media: "(min-width: 900px)", disabled: false, selector: ".wide" },
+      { media: "", disabled: true, selector: ".dark" },
+    ]);
+
+    // A script of the page changes the links. The sheets follow.
+    await c.js`
+      const links = [...document.querySelectorAll("link")];
+      links.find(link => link.media.startsWith("(min-width")).media = "(max-width: 600px)";
+      links.find(link => link.hasAttribute("disabled")).removeAttribute("disabled");
+    `;
+    expect(await hotSheets()).toEqual([
+      { media: "", disabled: false, selector: ".theme" },
+      { media: "(max-width: 600px)", disabled: false, selector: ".wide" },
+      { media: "", disabled: false, selector: ".dark" },
+    ]);
+
+    // A script removes a link, and then adds it again.
+    await c.js`
+      globalThis.wideLink = [...document.querySelectorAll("link")].find(link => link.hasAttribute("as"));
+      globalThis.wideLink.remove();
+    `;
+    expect(await hotSheets()).toEqual([
+      { media: "", disabled: false, selector: ".theme" },
+      { media: "", disabled: true, selector: ".wide" },
+      { media: "", disabled: false, selector: ".dark" },
+    ]);
+    await c.js`document.head.insertBefore(globalThis.wideLink, document.head.firstChild);`;
+    expect(await hotSheets()).toEqual([
+      { media: "", disabled: false, selector: ".theme" },
+      { media: "(max-width: 600px)", disabled: false, selector: ".wide" },
+      { media: "", disabled: false, selector: ".dark" },
+    ]);
   },
 });
 devTest("a page recovers after the missing @import of a shared stylesheet is created", {

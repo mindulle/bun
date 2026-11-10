@@ -525,6 +525,37 @@ console.log("About manifest:", aboutHtml);
     },
   });
 
+  // A stylesheet link with `media` gets a CSS file of its own, so the page links
+  // several CSS files. The server has to serve each of them.
+  itBundled("html-import/css-of-links-with-media-is-in-the-manifest", {
+    outdir: "out/",
+    target: "bun",
+    entryPoints: ["/server.js"],
+    files: {
+      "/server.js": `
+        import page from "./page.html";
+        console.log(page.index);
+      `,
+      "/page.html": `<!DOCTYPE html><html><head><link rel="stylesheet" href="./screen.css"><link rel="stylesheet" href="./print.css" media="print"></head><body><script type="module" src="./client.js"></script></body></html>`,
+      "/screen.css": `body { color: red; }`,
+      "/print.css": `body { color: black; }`,
+      "/from-script.css": `body { margin: 0; }`,
+      "/client.js": `import "./from-script.css";`,
+    },
+
+    onAfterBundle(api) {
+      const [page] = readManifests(api, "out/server.js");
+      const hrefs = [...api.readFile("out/page.html").matchAll(/href="([^"]+\.css)"/g)].map(match => match[1]);
+      expect(hrefs.length).toBe(3);
+      expect(
+        page.files
+          .filter(file => file.loader === "css")
+          .map(file => file.path)
+          .sort(),
+      ).toEqual(hrefs.sort());
+    },
+  });
+
   // Past 127 entry points the entry bits switch to a heap-allocated bitset.
   // The manifest has to size its own bitset from the same entry point list as
   // the files (which, with splitting, includes the dynamic imports), or the

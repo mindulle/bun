@@ -117,6 +117,47 @@ console.log(x);`,
     expect(styleCloseCount).toBe(1);
   });
 
+  // https://github.com/oven-sh/bun/issues/18526
+  test("a stylesheet link with media or disabled stays a <link>, with the CSS in its href", async () => {
+    using dir = tempDir("compile-browser-link-media", {
+      "index.html": `<!DOCTYPE html>
+<html>
+<head>
+<link rel="stylesheet" href="./screen.css">
+<link rel="stylesheet" type="text/css" href="./print.css" media="print" id="print" data-label='the "print" one'>
+<link rel="stylesheet" href="./dark.css" disabled>
+<link rel="stylesheet" href="./more.css">
+</head>
+<body><script src="./app.js"></script></body>
+</html>`,
+      "screen.css": `body { color: red; }`,
+      "print.css": `body { color: black; }`,
+      "dark.css": `body { background: black; }\nbody::after { content: "a&b"; }`,
+      "more.css": `body { margin: 0; }`,
+      "from-script.css": `body { padding: 0; }`,
+      "app.js": `import "./from-script.css";`,
+    });
+
+    const result = await Bun.build({
+      entrypoints: [`${dir}/index.html`],
+      compile: true,
+      target: "browser",
+      minify: true,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.outputs.length).toBe(1);
+    const html = await result.outputs[0].text();
+    // A `<style>` has no `disabled`, and a script that looks for the `<link>` would not find it.
+    // The CSS is the text of the `data:` URL, with `#` and the last line break as `%` escapes.
+    expect(html.match(/<style[^]*?<\/style>|<link[^>]*>/g)).toEqual([
+      `<style>body{color:red}\n</style>`,
+      `<link rel="stylesheet" type="text/css" media="print" id="print" data-label="the &quot;print&quot; one" href="data:text/css,body{color:%23000}%0A">`,
+      `<link rel="stylesheet" disabled href="data:text/css,body{background:%23000}body:after{content:&quot;a&amp;b&quot;}%0A">`,
+      `<style>body{margin:0}body{padding:0}\n</style>`,
+    ]);
+  });
+
   test("deep import chain with re-exports and multiple files", async () => {
     using dir = tempDir("compile-browser-deep-chain", {
       "index.html": `<!DOCTYPE html><html><body><script src="./app.js"></script></body></html>`,

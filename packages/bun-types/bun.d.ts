@@ -4789,7 +4789,13 @@ declare module "bun" {
         exports: string[];
         /** Entrypoint path, if this output is an entrypoint */
         entryPoint?: string;
-        /** Path to the associated CSS bundle (for JS entrypoints with CSS) */
+        /**
+         * Path to the associated CSS bundle (for JS entrypoints with CSS).
+         *
+         * Not set for an HTML entrypoint that has a stylesheet `<link>` with
+         * `media` or `disabled`. Such a page can have more than one CSS file,
+         * and each is in `outputs`.
+         */
         cssBundle?: string;
       };
     };

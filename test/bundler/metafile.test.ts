@@ -1570,6 +1570,43 @@ describe("metafile outputs[..].bytes is the size of the emitted file", () => {
     expect(reported).toEqual(actual);
   });
 
+  // A stylesheet link with `media` gets a CSS file of its own, so the document has several CSS outputs
+  // and no `cssBundle`.
+  test.each(destinations)("an HTML entry point with a stylesheet link that has media (%s)", async destination => {
+    using dir = tempDir("metafile-bytes-html-media", {
+      "index.html": `<!doctype html><html><head><link rel="stylesheet" href="./style.css"><link rel="stylesheet" href="./print.css" media="print"></head><body><script type="module" src="./app.ts"></script></body></html>\n`,
+      "app.ts": `console.log("app");\n`,
+      "style.css": `body { color: red; }\n`,
+      "print.css": `body { color: black; }\n`,
+    });
+    const outdir = outdirFor(dir, destination);
+
+    const result = await Bun.build({
+      entrypoints: [`${dir}/index.html`],
+      outdir,
+      metafile: true,
+    });
+    expect(result.success).toBe(true);
+
+    const html = await result.outputs.find(artifact => artifact.path.endsWith("index.html"))!.text();
+    const [style, print, script] = html.match(/(?:href|src)="\.\/[^"]+"/g)!.map(reference => reference.split('"')[1]);
+    expect(html).toContain(`<link rel="stylesheet" media="print" crossorigin href="${print}">`);
+
+    const { reported, actual } = outputSizes(result, outdir);
+    expect(Object.keys(reported).sort()).toEqual([style, print, script, "./index.html"].sort());
+    expect(reported).toEqual(actual);
+    const { outputs } = result.metafile as Metafile;
+    expect({
+      style: Object.keys(outputs[style].inputs),
+      print: Object.keys(outputs[print].inputs),
+      cssBundle: outputs[script].cssBundle,
+    }).toEqual({
+      style: [expect.stringMatching(/style\.css$/)],
+      print: [expect.stringMatching(/print\.css$/)],
+      cssBundle: undefined,
+    });
+  });
+
   // `compile` with `target: "browser"` writes one HTML file with the script and the stylesheet inlined.
   // Each inlined chunk keeps its metafile output, with no file of its own to compare against:
   // its bytes are what the document has between the tags.
