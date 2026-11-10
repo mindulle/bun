@@ -3589,7 +3589,7 @@ __attribute__((minsize)) static void evictModulesAndTheirImporters(Zig::GlobalOb
         loader->clearAll();
     }
     // A module that the running test file holds goes in the middle of the file: once it is out, nothing registered says what the file is linked to through it.
-    bool losesLinksOfTestFile = isTestFileRunning && plugins.testFile > 1 && !evict.all && !evict.isEndOfTestFile;
+    bool losesLinksOfTestFile = isTestFileRunning && plugins.isLaterTestFileRunning() && !evict.all;
     UncheckedKeyHashSet<JSC::JSPromise*> awaited;
     WTF::ListHashSet<String> stay;
     for (auto& key : keys) {
@@ -6629,8 +6629,7 @@ __attribute__((minsize)) static void giveBackPreloadModules(Zig::GlobalObject* g
 // Comes behind the preloads and in front of the load of each test file, the first too: what compiled code has loaded before the first call counts as loaded by a preload.
 extern "C" [[ZIG_EXPORT(nothrow)]] void JSMock__didBeginTestFile(Zig::GlobalObject* globalObject)
 {
-    // Here too, and not only where the file before ended: a pass between the two files may have added to it.
-    globalObject->onLoadPlugins.modulesHandedToTestFile.clear();
+    globalObject->onLoadPlugins.runningTestFile = globalObject->onLoadPlugins.testFile;
 #if ENABLE(AOT)
     if (globalObject->vm().hasCompiledCode()) {
         Bun::forgetAnswersKeptForLoader(globalObject);
@@ -7888,14 +7887,14 @@ void didHandModuleToTestFile(Zig::GlobalObject* globalObject, const String& key)
 {
     auto& plugins = globalObject->onLoadPlugins;
     // The file holds what it fetched anyway, and nothing evicts what a preload fetched.
-    unsigned fetchedBy = plugins.testFile > 1 ? plugins.testFileOfModule.get(key) : 0;
+    unsigned fetchedBy = plugins.isLaterTestFileRunning() ? plugins.testFileOfModule.get(key) : 0;
     if (fetchedBy && fetchedBy != plugins.testFile)
         plugins.modulesHandedToTestFile.add(key);
 }
 
 void didHandImportToTestFile(Zig::GlobalObject* globalObject, JSValue moduleNamespace)
 {
-    if (globalObject->onLoadPlugins.testFile == 1)
+    if (!globalObject->onLoadPlugins.isLaterTestFileRunning())
         return;
     if (auto* imported = dynamicDowncast<JSC::JSModuleNamespaceObject>(moduleNamespace))
         didHandModuleToTestFile(globalObject, imported->moduleRecord()->moduleKey().string());
