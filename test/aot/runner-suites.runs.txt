@@ -8,6 +8,13 @@
 test/js/bun/test/mock/mock-module.test.ts: a module mocked without a factory > a mocked package that another package imports > files that mock it between files that don't
 test/js/bun/test/mock/mock-module.test.ts: a module mocked without a factory > a mocked package that another package imports > later files mock a package that a library loaded while the first file mocked it
 test/js/bun/test/mock/mock-module.test.ts: a test file that has mocked modules > isn't evaluated again when a later file imports it, and keeps its exports
+# The next 6: when a test file mocks a module, plain runs the importers again that an earlier file left and this file doesn't hold. The body of a compiled file runs once.
+test/js/bun/test/mock/mock-module.test.ts: a test file that holds modules an earlier test file loaded > an importer of a module that the file holds is evaluated with the mock, and linked to that module
+test/js/bun/test/mock/mock-module.test.ts: a test file that holds modules an earlier test file loaded > an importer that the file has yet to import is evaluated with the mock
+test/js/bun/test/mock/mock-module.test.ts: a test file that holds modules an earlier test file loaded > import() that is under way when the mock is made is evaluated with the mock
+test/js/bun/test/mock/mock-module.test.ts: a test file that holds modules an earlier test file loaded > the next test file gets the modules that were not mocked ["--parallel=1","--no-isolate"]
+test/js/bun/test/mock/mock-module.test.ts: a test file that holds modules an earlier test file loaded > the next test file gets the modules that were not mocked []
+test/js/bun/test/mock/mock-module.test.ts: a test file that holds modules an earlier test file loaded > vi.importActual() that is under way when the mock is made is evaluated with the mock
 test/js/bun/test/mock/mock-module.test.ts: a test file's module mocks are undone when it ends > a preload's mocks are kept
 test/js/bun/test/mock/mock-module.test.ts: a test file's module mocks are undone when it ends > also when the file fails to load, or has already removed the mock itself
 test/js/bun/test/mock/mock-module.test.ts: a test file's module mocks are undone when it ends > mocks, mocks, plain
