@@ -150,7 +150,12 @@ public:
         unsigned testFile = 1;
         // The modules that have called mock.module(), vi.mock() and the like since the running test file started.
         WTF::UncheckedKeyHashSet<String> modulesThatMocked = {};
+        // The test file that fetched each module. A later file that imports the module is linked to the same record, and isn't named here.
         WTF::UncheckedKeyHashMap<String, unsigned> testFileOfModule = {};
+        // Modules that an earlier test file fetched and the running one holds with no link in the registry or require.cache to show it.
+        WTF::UncheckedKeyHashSet<String> modulesHandedToTestFile = {};
+        // The objects behind `require` of ES modules. What one gets out of require.cache is listed in its children and nowhere else.
+        Vector<JSC::Weak<JSC::JSObject>> requirersOfESModules = {};
         WTF::ListHashSet<String> modulesToEvictOnceLoaded = {};
         // The pending loads those modules are waiting for. Each gets exactly one reaction. Weak, so a load that never settles doesn't keep its global object alive.
         WTF::UncheckedKeyHashMap<JSC::JSPromise*, JSC::Weak<JSC::JSPromise>> loadsOfModulesToEvict = {};
@@ -358,5 +363,11 @@ JSC::JSObject* objectHoldingExportOfCompiledModuleMock(JSC::JSGlobalObject*, JSC
 // Flushes modulesToEvictOnceLoaded after a synchronous load. Does nothing inside an outer synchronous load.
 void evictModulesThatHaveLoaded(Zig::GlobalObject*);
 void evictModuleThatNothingFetches(Zig::GlobalObject*, const JSC::Identifier& key);
+// The running test file holds the module from here on. Only a module that an earlier test file fetched is recorded: OnLoad::modulesHandedToTestFile.
+void didHandModuleToTestFile(Zig::GlobalObject*, const String& key);
+// The same for what an import() was fulfilled with.
+void didHandImportToTestFile(Zig::GlobalObject*, JSC::JSValue moduleNamespace);
+// `require` is the function that Bun makes for an ES module: OnLoad::requirersOfESModules.
+void didCreateRequireOfESModule(Zig::GlobalObject*, JSC::JSObject* require);
 JSC::Structure* createModuleMockStructure(JSC::VM& vm, JSC::JSGlobalObject* globalObject, JSC::JSValue prototype);
 }

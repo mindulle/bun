@@ -3,6 +3,7 @@
 #include "root.h"
 #include <JavaScriptCore/LazyProperty.h>
 #include <JavaScriptCore/Strong.h>
+#include <wtf/Function.h>
 
 namespace WebCore {
 }
@@ -24,6 +25,10 @@ JSC::JSValue mockObject(Zig::GlobalObject*, JSC::JSValue exports, bool spy, bool
 // For `vi.dynamicImportSettled()`. `import` is the module loader's own promise for an `import()`, not the one script gets.
 // `key` is null unless there are module mocks.
 void didStartDynamicImport(Zig::GlobalObject*, JSC::JSPromise* import, const String& key);
+// The same for a load that vi.importActual() or vi.importMock() starts. `vi.dynamicImportSettled()` doesn't wait for it.
+void didStartImportOfActualModule(Zig::GlobalObject*, JSC::JSPromise* import);
+// Calls `functor` with what each of those imports was fulfilled with, while it is still listed. The others went to didHandImportToTestFile().
+void forEachImportHandedToTestFile(Zig::GlobalObject*, const WTF::Function<void(JSC::JSValue)>& functor);
 
 // Wrapper to scope a bunch of GlobalObject properties related to mocks
 class JSMockModule final {

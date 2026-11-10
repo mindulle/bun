@@ -801,6 +801,8 @@ void ImportMetaObject::finishCreation(VM& vm)
         ASSERT(object);
         if (meta->isOfCompiledModule)
             Bun::didCreateRequireOfCompiledModule(object);
+        if (isBunTest && !meta->moduleGraph()) [[unlikely]]
+            Bun::didCreateRequireOfESModule(uncheckedDowncast<Zig::GlobalObject>(meta->globalObject()), object);
         init.set(uncheckedDowncast<JSFunction>(object));
     });
     this->urlProperty.initLater([](const JSC::LazyProperty<JSC::JSObject, JSC::JSString>::Initializer& init) {

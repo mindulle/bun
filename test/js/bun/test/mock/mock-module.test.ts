@@ -6354,6 +6354,339 @@ describe.concurrent("vi.mock() with an async factory, of a module that is loaded
   });
 });
 
+// A later test file is linked to the modules that an earlier one left loaded. The file that fetched a module doesn't say which file holds it.
+describe.concurrent("a test file that holds modules an earlier test file loaded", () => {
+  const mockDep = `("./dep.js", () => ({ dep: () => "mock-dep" }));`;
+  const mockUtils = `("./utils.js", () => ({ util: () => "mock-util" }));`;
+  const graph = {
+    "dep.js": `export const dep = () => "real-dep";`,
+    "utils.js": `import { dep } from "./dep.js"; export const util = () => "real-util+" + dep();`,
+    "consumer.js": `import { util } from "./utils.js"; export const consume = () => util();`,
+    // Each reads the module below it while it is evaluated.
+    "snap.js": `import { dep } from "./dep.js"; export const atLoad = dep();`,
+    "top.js": `import { consume } from "./consumer.js"; export const atLoad = consume();`,
+    "other.js": `export const other = () => "real-other";`,
+    "dep.cjs": `exports.dep = () => "real-dep";`,
+    "utils.cjs": `const dep = require("./dep.cjs"); exports.util = () => "real-util+" + dep.dep();`,
+    "consumer.cjs": `const utils = require("./utils.cjs"); exports.consume = () => utils.util();`,
+    "node_modules/pkg/package.json": JSON.stringify({ name: "pkg", main: "./index.js" }),
+    "node_modules/pkg/index.js": `exports.p = () => "real-pkg";`,
+    "user.js": `import { p } from "pkg"; export const useP = () => "user+" + p();`,
+    "host.js": `import { hostname } from "node:os"; export const host = () => "host+" + hostname();`,
+    // No test file but the second one loads these two.
+    "fresh.js": `import { consume } from "./consumer.js"; export const viaFresh = () => consume();`,
+    "mocks.js": `import { mock } from "bun:test"; mock.module${mockDep} mock.module${mockUtils}`,
+    "preload.js": `import * as consumer from "./consumer.js"; globalThis.consumerOfPreload = consumer;`,
+    "a.test.js": `
+      import { expect, test } from "bun:test";
+      import { consume } from "./consumer.js";
+      import { atLoad as snap } from "./snap.js";
+      import { atLoad as top } from "./top.js";
+      import { other } from "./other.js";
+      import { useP } from "./user.js";
+      import { host } from "./host.js";
+      test("loads the modules, and mocks none", () => {
+        expect([consume(), snap, top, other(), useP(), require("./consumer.cjs").consume()]).toEqual([
+          "real-util+real-dep",
+          "real-dep",
+          "real-util+real-dep",
+          "real-other",
+          "user+real-pkg",
+          "real-util+real-dep",
+        ]);
+        expect(host()).toStartWith("host+");
+      });
+    `,
+  };
+  const imports = `import { beforeAll, expect, jest, mock, test, vi } from "bun:test";`;
+  const twoMocks = `mock.module${mockDep} mock.module${mockUtils}`;
+  const secondMockReachesFile = `test("the second mock reaches it", () => expect(consume()).toBe("mock-util"));`;
+  const mocksInTestReachFile = `test("the second mock reaches it", () => { ${twoMocks} expect(consume()).toBe("mock-util"); });`;
+
+  // [title, the second test file, the tests in it]. What each expects is what the file gets when it runs alone.
+  const laterFiles: [string, string, number?][] = [
+    ...[
+      ["mock.module()", twoMocks],
+      ["jest.doMock()", `jest.doMock${mockDep} jest.doMock${mockUtils}`],
+      ["mock.module() in beforeAll()", `beforeAll(() => { ${twoMocks} });`],
+      ["jest.mock() in beforeAll()", `beforeAll(() => { jest.mock${mockDep} jest.mock${mockUtils} });`],
+      ["vi.mock() in beforeAll()", `beforeAll(() => { vi.mock${mockDep} vi.mock${mockUtils} });`],
+      ["a module that the file imports", `import "./mocks.js";`],
+    ].map(([by, mocks]): [string, string] => [
+      `a mock of a module, then of its importer, by ${by}`,
+      `${imports} import { consume } from "./consumer.js"; ${mocks} ${secondMockReachesFile}`,
+    ]),
+    ...[
+      ["import()", `const { consume } = await import("./consumer.js");`],
+      ["require()", `const { consume } = require("./consumer.js");`],
+      ["a module that only this file loads", `import { viaFresh as consume } from "./fresh.js";`],
+      ["vi.importActual()", `const { consume } = await vi.importActual("./consumer.js");`],
+      ["jest.requireActual()", `const { consume } = jest.requireActual("./consumer.js");`],
+      [
+        "an import that a hoisted mock turns into import()",
+        `import { consume } from "./consumer.js"; jest.mock("./other.js");`,
+      ],
+    ].map(([by, hold]): [string, string] => [
+      `the file has the importer from ${by}`,
+      `${imports} ${hold} ${twoMocks} ${secondMockReachesFile}`,
+    ]),
+    [
+      "the file imports from vitest",
+      `
+        import { expect, test } from "vitest";
+        import { mock } from "bun:test";
+        import { consume } from "./consumer.js";
+        test("the second mock reaches it", async () => {
+          ${twoMocks}
+          expect(consume()).toBe("mock-util");
+          expect((await import("./consumer.js")).consume).toBe(consume);
+        });
+      `,
+    ],
+    ["the mocks are made in a test", `${imports} import { consume } from "./consumer.js"; ${mocksInTestReachFile}`],
+    [
+      "a mock of the module that the file imports itself",
+      `
+        ${imports}
+        import { consume } from "./consumer.js";
+        mock.module${mockDep}
+        mock.module("./consumer.js", () => ({ consume: () => "mock-consumer" }));
+        test("the file's binding is the mock", () => expect(consume()).toBe("mock-consumer"));
+      `,
+    ],
+    [
+      "a mock of a builtin module, then of its importer",
+      `
+        ${imports}
+        import { host } from "./host.js";
+        mock.module("node:os", () => ({ hostname: () => "mock-os" }));
+        mock.module("./host.js", () => ({ host: () => "mock-host" }));
+        test("the second mock reaches the file", () => expect(host()).toBe("mock-host"));
+      `,
+    ],
+    [
+      "import() after a mock gives the module that the file is linked to",
+      `
+        ${imports}
+        import * as utils from "./utils.js";
+        mock.module${mockDep}
+        test("one instance", async () => {
+          expect(await import("./utils.js")).toBe(utils);
+          expect(utils.util()).toBe("real-util+mock-dep");
+        });
+      `,
+    ],
+    [
+      "CommonJS modules that the file got out of require.cache stay in it",
+      `
+        ${imports}
+        import { basename } from "node:path";
+        const consumer = require("./consumer.cjs");
+        mock.module("./dep.cjs", () => ({ dep: () => "mock-dep" }));
+        test("one instance", () => {
+          expect(Object.keys(require.cache).filter(key => key.endsWith(".cjs")).map(key => basename(key)).sort()).toEqual(["consumer.cjs", "dep.cjs", "utils.cjs"]);
+          expect(require("./consumer.cjs")).toBe(consumer);
+        });
+      `,
+    ],
+    [
+      "vi.mock() of a package, then a mock of its importer",
+      `
+        ${imports}
+        import { useP } from "./user.js";
+        test("the second mock reaches the file", () => {
+          vi.mock("pkg", () => ({ p: () => "mock-pkg" }));
+          mock.module("./user.js", () => ({ useP: () => "mock-user" }));
+          expect(useP()).toBe("mock-user");
+        });
+      `,
+    ],
+    [
+      "vi.doMock() of a package leaves its importer with the file",
+      `
+        ${imports}
+        import * as user from "./user.js";
+        test("one instance, not mocked", async () => {
+          vi.doMock("pkg", () => ({ p: () => "mock-pkg" }));
+          expect(await import("./user.js")).toBe(user);
+          expect(user.useP()).toBe("user+real-pkg");
+        });
+      `,
+    ],
+    ...[
+      ["a static import", `import * as consumer from "./consumer.js";`],
+      ["import()", `const consumer = await import("./consumer.js");`],
+      ["require()", `const consumer = require("./consumer.js");`],
+      ["a module that only this file loads", `import "./fresh.js"; const consumer = await import("./consumer.js");`],
+    ].map(([by, hold]): [string, string] => [
+      `vi.doMock() leaves a module with the file that has its importer from ${by}`,
+      `
+        ${imports}
+        ${hold}
+        test("the importer is one instance, and not mocked", async () => {
+          vi.doMock${mockDep}
+          vi.doMock${mockUtils}
+          expect((await import("./consumer.js")).consume).toBe(consumer.consume);
+          expect(consumer.consume()).toBe("real-util+real-dep");
+          expect((await import("./utils.js")).util()).toBe("mock-util");
+        });
+      `,
+    ]),
+    [
+      "vi.doMock() in a file that imports from vitest",
+      `
+        import { expect, test, vi } from "vitest";
+        import { consume } from "./consumer.js";
+        test("the importer is one instance, and not mocked", async () => {
+          vi.doMock${mockUtils}
+          expect((await import("./consumer.js")).consume).toBe(consume);
+          expect(consume()).toBe("real-util+real-dep");
+        });
+      `,
+    ],
+    [
+      "vi.importActual() of a module that vi.doMock() mocked is the module that the file holds",
+      `
+        ${imports}
+        import * as utils from "./utils.js";
+        test("one instance", async () => {
+          vi.doMock${mockUtils}
+          expect((await vi.importActual("./utils.js")).util).toBe(utils.util);
+          vi.doUnmock("./utils.js");
+          expect((await import("./utils.js")).util).toBe(utils.util);
+        });
+      `,
+    ],
+    [
+      "a mock after a jest.unmock() that took the file out of the registry",
+      `
+        ${imports}
+        import { consume } from "./consumer.js";
+        import { other } from "./other.js";
+        test("a mock of an import of the file ends", () => {
+          mock.module("./other.js", () => ({ other: () => "mock-other" }));
+          jest.unmock("./other.js");
+          expect(other()).toBe("real-other");
+        });
+        ${mocksInTestReachFile}
+      `,
+      2,
+    ],
+    [
+      "a mock after a vi.doMock() that ended",
+      `
+        ${imports}
+        import { consume } from "./consumer.js";
+        import { other } from "./other.js";
+        test("a mock of an import of the file ends", () => {
+          {
+            using _ = vi.doMock("./other.js", () => ({ other: () => "mock-other" }));
+          }
+          expect(other()).toBe("real-other");
+        });
+        ${mocksInTestReachFile}
+      `,
+      2,
+    ],
+    // The rest passes without the fix too: what the file doesn't hold when the mock is made is still evaluated again.
+    [
+      "an importer that the file has yet to import is evaluated with the mock",
+      `
+        ${imports}
+        import { consume } from "./consumer.js";
+        mock.module${mockDep}
+        test("evaluated again", async () => {
+          expect((await import("./snap.js")).atLoad).toBe("mock-dep");
+          expect(consume()).toBe("real-util+mock-dep");
+        });
+      `,
+    ],
+    [
+      "an importer of a module that the file holds is evaluated with the mock, and linked to that module",
+      `
+        ${imports}
+        import * as consumer from "./consumer.js";
+        mock.module${mockDep}
+        test("evaluated again", async () => {
+          expect((await import("./top.js")).atLoad).toBe("real-util+mock-dep");
+          expect(await import("./consumer.js")).toBe(consumer);
+        });
+      `,
+    ],
+    ...["import", "vi.importActual"].map((load): [string, string] => [
+      `${load}() that is under way when the mock is made is evaluated with the mock`,
+      `
+        ${imports}
+        const snap = ${load}("./snap.js");
+        mock.module${mockDep}
+        test("evaluated again", async () => expect((await snap).atLoad).toBe("mock-dep"));
+      `,
+    ]),
+  ];
+
+  test.each(laterFiles)("%s", async (_, later, tests = 1) => {
+    await expectFixturesToPass({ ...graph, "b.test.js": later }, 1 + tests, ["./a.test.js", "./b.test.js"]);
+  });
+
+  // Several of them to a child run: each file gets a registry of its own there.
+  const perRun = 6;
+  describe.each(isolationFlags.slice(1))("every one of those files gets the same by itself %j", args => {
+    test.each(Array.from({ length: Math.ceil(laterFiles.length / perRun) }, (_, run) => run * perRun))(
+      "from file %i on",
+      async first => {
+        const files: Record<string, string> = { ...graph };
+        const run = laterFiles.slice(first, first + perRun);
+        run.forEach(([, later], index) => (files[`later${index}.test.js`] = later));
+        const pass = run.reduce((sum, [, , tests = 1]) => sum + tests, 1);
+        await expectFixturesToPass(files, pass, [
+          ...args,
+          "./a.test.js",
+          ...run.map((_, index) => `./later${index}.test.js`),
+        ]);
+      },
+    );
+  });
+
+  test.each([[[]], [["--parallel=1", "--no-isolate"]]])(
+    "the next test file gets the modules that were not mocked %j",
+    async args => {
+      await expectFixturesToPass(
+        {
+          ...graph,
+          "b.test.js": `${imports} import { consume } from "./consumer.js"; ${twoMocks} ${secondMockReachesFile}`,
+          "c.test.js": `
+          ${imports}
+          import { consume } from "./consumer.js";
+          import { atLoad } from "./snap.js";
+          test("not mocked", () => expect([consume(), atLoad]).toEqual(["real-util+real-dep", "real-dep"]));
+        `,
+        },
+        3,
+        [...args, "./a.test.js", "./b.test.js", "./c.test.js"],
+      );
+    },
+  );
+
+  test("modules that a preload loaded stay as they are", async () => {
+    await expectFixturesToPass(
+      {
+        ...graph,
+        "b.test.js": `
+          ${imports}
+          import * as consumer from "./consumer.js";
+          ${twoMocks}
+          test("the second mock reaches it", async () => {
+            expect(consumer.consume()).toBe("mock-util");
+            expect([consumer, await import("./consumer.js")]).toEqual([consumerOfPreload, consumerOfPreload]);
+          });
+        `,
+      },
+      2,
+      ["--preload", "./preload.js", "./a.test.js", "./b.test.js"],
+    );
+  });
+});
+
 describe.concurrent("a module that a preload loaded, after a test file evicts it", () => {
   test("is the same instance, and a new importer still links to all of its re-exports", async () => {
     await expectFixturesToPass(
