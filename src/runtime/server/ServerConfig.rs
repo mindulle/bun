@@ -535,14 +535,12 @@ fn validate_route_name(global: &JSGlobalObject, path: &[u8]) -> JsResult<()> {
 
     // For now, we don't support params that start with a number.
     // Mostly because it makes the params object more complicated to implement and it's easier to cut scope this way for now.
-    let mut remaining = path;
     let mut duped_route_names: StringHashMap<()> = StringHashMap::new();
-    while let Some(index) = strings::index_of_char(remaining, b':') {
-        remaining = &remaining[(index + 1) as usize..];
-        let end = strings::index_of_char(remaining, b'/')
-            .map(|i| i as usize)
-            .unwrap_or(remaining.len());
-        let route_name = &remaining[..end];
+    // As in uWS's router, a parameter is a whole segment.
+    for segment in strings::split(path, b"/") {
+        let Some(route_name) = segment.strip_prefix(b":") else {
+            continue;
+        };
         if !route_name.is_empty() && route_name[0].is_ascii_digit() {
             return Err(global.throw_todo(
                 b"Route parameter names cannot start with a number.\n\n\
@@ -557,8 +555,6 @@ fn validate_route_name(global: &JSGlobalObject, path: &[u8]) -> JsResult<()> {
                   If you run into this, please file an issue and we will add support for it.",
             ));
         }
-
-        remaining = &remaining[end..];
     }
     Ok(())
 }

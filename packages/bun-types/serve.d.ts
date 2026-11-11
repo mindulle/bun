@@ -615,9 +615,9 @@ declare module "bun" {
   namespace Serve {
     type ExtractRouteParams<T> = string extends T
       ? Record<string, string>
-      : T extends `${string}:${infer Param}/${infer Rest}`
-        ? { [K in Param]: string } & ExtractRouteParams<Rest>
-        : T extends `${string}:${infer Param}`
+      : T extends `${string}/:${infer Param}/${infer Rest}`
+        ? { [K in Param]: string } & ExtractRouteParams<`/${Rest}`>
+        : T extends `${string}/:${infer Param}`
           ? { [K in Param]: string }
           : T extends `${string}*`
             ? {}

@@ -7,6 +7,13 @@ Bun.serve({
     "/:id/:test": req => {
       expectType(req.params).is<{ id: string; test: string }>();
     },
+    // A parameter is a whole segment.
+    "/x:a/:b": req => {
+      expectType(req.params).is<{ b: string }>();
+    },
+    "/:a:b/:c": req => {
+      expectType(req.params).is<{ "a:b": string; c: string }>();
+    },
   },
   fetch: () => new Response("hello"),
   websocket: {

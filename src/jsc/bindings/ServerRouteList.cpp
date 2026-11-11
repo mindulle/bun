@@ -125,7 +125,7 @@ private:
             for (size_t j = 0; j < path.length(); j++) {
                 switch (path[j]) {
                 case '/': {
-                    if (startOfIdentifier && startOfIdentifier < j) {
+                    if (startOfIdentifier) {
                         WTF::String&& identifier = path.substring(startOfIdentifier, j - startOfIdentifier);
                         m_pathIdentifiers.append(JSC::Identifier::fromString(vm, identifier));
                         identifierCount++;
@@ -134,7 +134,9 @@ private:
                     break;
                 }
                 case ':': {
-                    startOfIdentifier = j + 1;
+                    // As in uWS's router, a parameter is a whole segment.
+                    if (j && path[j - 1] == '/')
+                        startOfIdentifier = j + 1;
                     break;
                 }
                 default: {
@@ -142,7 +144,7 @@ private:
                 }
                 }
             }
-            if (startOfIdentifier && startOfIdentifier < path.length()) {
+            if (startOfIdentifier) {
                 WTF::String&& identifier = path.substring(startOfIdentifier, path.length() - startOfIdentifier);
                 m_pathIdentifiers.append(JSC::Identifier::fromString(vm, identifier));
                 identifierCount++;
