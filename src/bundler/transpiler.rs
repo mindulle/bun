@@ -554,7 +554,7 @@ impl<'a> Transpiler<'a> {
                 if let Some(tsconfig) = self.resolver.tsconfig_json(&root_dir) {
                     // Beside a bunfig.toml, a `--jsx-*` flag or `Bun.build()`, only `run_env_loader` takes its JSX.
                     if self.options.transform_options.jsx.is_empty() {
-                        self.options.lay_over_jsx(&tsconfig.jsx);
+                        self.options.lay_tsconfig_over_jsx(&tsconfig.jsx);
                     }
                     self.options.emit_decorator_metadata = tsconfig.emit_decorator_metadata;
                     self.options.experimental_decorators = tsconfig.experimental_decorators;
@@ -621,7 +621,7 @@ impl<'a> Transpiler<'a> {
                 };
 
                 if let Some(tsconfig) = self.resolver.tsconfig_json(&dir_info) {
-                    self.options.lay_over_jsx(&tsconfig.jsx);
+                    self.options.lay_tsconfig_over_jsx(&tsconfig.jsx);
                 }
 
                 // Copy the listing's basenames out under `entries_mutex`,

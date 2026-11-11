@@ -21,6 +21,8 @@ console.log(<Component message="Hello world!" />);
 
 Bun reads your `tsconfig.json` or `jsconfig.json` to determine how to perform the JSX transform internally. If you'd rather not use either, you can set the same options in [`bunfig.toml`](/runtime/bunfig).
 
+An option that you set in `bunfig.toml`, with a `--jsx-*` flag, or in the `jsx` option of [`Bun.build`](/bundler#jsx) wins over the same option in `tsconfig.json`.
+
 Bun respects the following compiler options.
 
 ### [`jsx`](https://www.typescriptlang.org/tsconfig#jsx)

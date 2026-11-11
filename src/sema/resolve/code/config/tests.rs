@@ -483,6 +483,38 @@ fn settings_start_from_command_line() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+fn config_does_not_decide_what_the_program_states() {
+    let written = r#"{"jsx": "react-jsx", "jsxFactory": "config", "jsxFragmentFactory": "config", "jsxImportSource": "config"}"#;
+    let host = config_host("/lib/tsconfig.json", written);
+    let mut options = bun_run();
+    options.jsx.runtime = JsxRuntime::Classic;
+    options.jsx.factory = vec![b"program".to_vec()];
+    options.jsx.import_source = b"program".to_vec();
+    let of = |options: &CodeOptions| render_jsx(&settings_with(&host, options, "/lib/a.tsx").jsx);
+    assert_eq!(of(&options), "Automatic dev config config config");
+
+    options.jsx_stated.runtime = true;
+    options.jsx_stated.factory = true;
+    assert_eq!(of(&options), "Classic dev program config config");
+    options.jsx_stated.fragment = true;
+    options.jsx_stated.import_source = true;
+    assert_eq!(of(&options), "Classic dev program React.Fragment program");
+
+    // `development` of the config that `bun run` takes.
+    let host = config_host("/app/tsconfig.json", r#"{"jsx": "react-jsx"}"#);
+    let is_development = |options: &CodeOptions| {
+        settings_with(&host, options, "/app/a.tsx")
+            .jsx
+            .is_development
+    };
+    let mut options = bun_run();
+    assert!(!is_development(&options));
+    options.jsx_stated.is_development = true;
+    assert!(is_development(&options));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
 fn options_of_other_json_types_are_ignored() {
     let ignored = lib_settings(
         r#"{

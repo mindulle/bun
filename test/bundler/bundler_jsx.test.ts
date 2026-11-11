@@ -1179,6 +1179,43 @@ describe("bundler", () => {
       });
     });
 
+    // https://github.com/oven-sh/bun/issues/15844
+    test("an option that jsx states is not taken from tsconfig.json", async () => {
+      const automatic = (source: string) =>
+        `import { jsxDEV } from "${source}/jsx-dev-runtime"; console.log(/* @__PURE__ */ jsxDEV("div", {}, undefined, false, undefined, this));`;
+      // [`jsx`, the output after the name of the entry point]
+      const cases: [jsx: object, output: string][] = [
+        [{ runtime: "classic", factory: "stated" }, `console.log(/* @__PURE__ */ stated("div", null));`],
+        [{ importSource: "stated" }, automatic("stated")],
+        // tsconfig.json still decides what `jsx` does not state.
+        [{ factory: "stated" }, automatic("from-tsconfig")],
+      ];
+      using dir = tempDir("bun-build-jsx-over-tsconfig", {
+        "tsconfig.json": JSON.stringify({ compilerOptions: { jsx: "react-jsxdev", jsxImportSource: "from-tsconfig" } }),
+        "element.jsx": `console.log(<div />);`,
+        "build.fixture.js": `
+          for (const jsx of ${JSON.stringify(cases.map(([jsx]) => jsx))}) {
+            const built = await Bun.build({ entrypoints: ["./element.jsx"], packages: "external", jsx });
+            console.log((await built.outputs[0].text()).trim().split("\\n").slice(1).join(" "));
+          }
+        `,
+      });
+
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "build.fixture.js"],
+        env: { ...bunEnv, NODE_ENV: undefined, BUN_ENV: undefined },
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({ lines: stdout.trim().split("\n"), stderr, exitCode }).toEqual({
+        lines: cases.map(([, output]) => output),
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+
     test("a macro is compiled with the jsx option of its build", async () => {
       using dir = tempDir("bun-build-jsx-macro", {
         "macro.jsx": `

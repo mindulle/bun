@@ -227,6 +227,78 @@ describe("--jsx-* flags beside a bunfig.toml", () => {
   });
 });
 
+// https://github.com/oven-sh/bun/issues/15844
+describe("an option that bunfig.toml or a --jsx-* flag states is not taken from tsconfig.json", () => {
+  const runtimeOf = (name: string) => ({
+    [`node_modules/${name}/jsx-runtime.js`]: `export const jsx = () => "${name} jsx", jsxs = jsx, Fragment = "";`,
+    [`node_modules/${name}/jsx-dev-runtime.js`]: `export const jsxDEV = () => "${name} jsxDEV", Fragment = "";`,
+  });
+  const files = {
+    ...runtimeOf("from-tsconfig"),
+    ...runtimeOf("stated"),
+    "m.jsx": `
+      Object.assign(globalThis, {
+        React: { createElement: () => "React.createElement" },
+        stated: () => "stated",
+        fromTsconfig: () => "fromTsconfig",
+      });
+      console.log(<div />);
+    `,
+  };
+  const automatic = { jsx: "react-jsx", jsxImportSource: "from-tsconfig" };
+  const automaticDev = { jsx: "react-jsxdev", jsxImportSource: "from-tsconfig" };
+
+  // [name, compilerOptions, bunfig.toml, flags, what the element prints]
+  const cases = [
+    ["bunfig.toml: jsx and jsxFactory", automatic, `jsx = "react"\njsxFactory = "stated"\n`, [], "stated"],
+    ["bunfig.toml: jsxImportSource", automaticDev, `jsxImportSource = "stated"\n`, [], "stated jsxDEV"],
+    ['bunfig.toml: jsx = "react-jsxDEV"', automatic, `jsx = "react-jsxDEV"\n`, [], "from-tsconfig jsxDEV"],
+    ["flags: --jsx-runtime and --jsx-factory", automatic, "", ["--jsx-runtime=classic", "--jsx-factory=stated"], "stated"],
+    ["flags: --jsx-import-source", automatic, "", ["--jsx-import-source=stated"], "stated jsx"],
+    // tsconfig.json still decides what no other source states.
+    [
+      "bunfig.toml: only jsxImportSource beside a classic tsconfig.json",
+      { jsx: "react", jsxFactory: "fromTsconfig" },
+      `jsxImportSource = "stated"\n`,
+      [],
+      "fromTsconfig",
+    ],
+  ] as const;
+
+  test.concurrent.each(cases)("%s", async (_, compilerOptions, bunfig, flags, printed) => {
+    using dir = tempDir("jsx-stated-over-tsconfig", {
+      ...files,
+      "tsconfig.json": JSON.stringify({ compilerOptions }),
+      ...(bunfig && { "bunfig.toml": bunfig }),
+    });
+    const run = async (...cmd: string[]) => {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), ...cmd],
+        env: { ...bunEnv, NODE_ENV: undefined, BUN_ENV: undefined },
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout, exitCode };
+    };
+    // The runtime, then a bundle and a file transpiled alone, each run afterwards.
+    const [ran, bundled, transpiled] = await Promise.all([
+      run(...flags, "m.jsx"),
+      run("build", ...flags, "m.jsx", "--target=bun", "--outfile=bundled.js"),
+      run("build", ...flags, "--no-bundle", "m.jsx", "--outfile=transpiled.js"),
+    ]);
+    expect({ bundled: bundled.exitCode, transpiled: transpiled.exitCode }).toEqual({ bundled: 0, transpiled: 0 });
+    const [ranBundled, ranTranspiled] = await Promise.all([run("bundled.js"), run("transpiled.js")]);
+    const expected = { stdout: printed + "\n", exitCode: 0 };
+    expect({ ran, ranBundled, ranTranspiled }).toEqual({
+      ran: expected,
+      ranBundled: expected,
+      ranTranspiled: expected,
+    });
+  });
+});
+
 describe("removed solid jsx runtime", () => {
   test.concurrent('bunfig.toml jsx = "solid" is an error', async () => {
     using dir = tempDir("jsx-bunfig-solid", {

@@ -65,6 +65,38 @@ impl JsxSettings {
     }
 }
 
+/// The JSX options that the program's own sources state: a tsconfig.json does not decide them.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct JsxStated {
+    pub runtime: bool,
+    pub is_development: bool,
+    pub factory: bool,
+    pub fragment: bool,
+    pub import_source: bool,
+}
+
+impl JsxStated {
+    /// `decided` with each stated option as `program` has it.
+    fn keep(&self, mut decided: JsxSettings, program: &JsxSettings) -> JsxSettings {
+        if self.runtime {
+            decided.runtime = program.runtime;
+        }
+        if self.is_development {
+            decided.is_development = program.is_development;
+        }
+        if self.factory {
+            decided.factory.clone_from(&program.factory);
+        }
+        if self.fragment {
+            decided.fragment.clone_from(&program.fragment);
+        }
+        if self.import_source {
+            decided.import_source.clone_from(&program.import_source);
+        }
+        decided
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TranspileSettings {
     pub jsx: JsxSettings,
@@ -429,10 +461,12 @@ impl<'h> Resolver<'h> {
 
     fn create_settings(&self, config: &ParsedConfig) -> &'h TranspileSettings {
         let session: &'h Session = self.session;
+        let options = self.code_options();
+        let jsx = config.jsx.apply_to(&options.jsx);
         session.keep(TranspileSettings {
             jsx: JsxSettings {
                 is_development: self.is_jsx_development(),
-                ..config.jsx.apply_to(&self.code_options().jsx)
+                ..options.jsx_stated.keep(jsx, &options.jsx)
             },
             experimental_decorators: config.experimental_decorators,
             emits_decorator_metadata: config.emits_decorator_metadata,
@@ -464,7 +498,8 @@ impl<'h> Resolver<'h> {
             }
             let taken = self.load_config_that_bun_run_takes();
             let written = taken.and_then(|taken| taken.jsx.is_development);
-            written.unwrap_or(options.jsx.is_development)
+            let decides = !options.jsx_stated.is_development;
+            (written.filter(|_| decides)).unwrap_or(options.jsx.is_development)
         })
     }
 }

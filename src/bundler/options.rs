@@ -1308,6 +1308,8 @@ pub struct BundleOptions<'a> {
     pub jsx: jsx::Pragma,
     /// `transform_options.jsx` as one layer: what bunfig.toml, the `--jsx-*` flags and `Bun.build()` give.
     pub jsx_user: jsx::Stated,
+    /// What those sources state themselves: a tsconfig.json does not decide these options.
+    pub jsx_user_stated: jsx::Stated,
     /// What the working directory's tsconfig.json and the environment state, later over earlier.
     pub jsx_cwd: jsx::Stated,
     pub emit_decorator_metadata: bool,
@@ -1546,12 +1548,15 @@ impl<'a> BundleOptions<'a> {
 
     /// `development` as the environment chooses it: `NODE_ENV`, `--production`, the mode of a server.
     pub fn set_jsx_development(&mut self, development: bool) {
-        self.lay_over_jsx(&jsx::Stated::of_development(development));
+        self.jsx_cwd
+            .lay_over(&jsx::Stated::of_development(development));
+        self.jsx = jsx::Pragma::resolve(&[&self.jsx_user, &self.jsx_cwd]);
     }
 
-    /// Lays `layer` over `jsx_cwd` and resolves `jsx` from the layers again.
-    pub(crate) fn lay_over_jsx(&mut self, layer: &jsx::Stated) {
-        self.jsx_cwd.lay_over(layer);
+    /// Lays the tsconfig.json of the working directory over `jsx_cwd` and resolves `jsx` from the layers again.
+    pub(crate) fn lay_tsconfig_over_jsx(&mut self, tsconfig: &jsx::Stated) {
+        self.jsx_cwd
+            .lay_tsconfig_over(tsconfig, &self.jsx_user_stated);
         self.jsx = jsx::Pragma::resolve(&[&self.jsx_user, &self.jsx_cwd]);
     }
 
@@ -1563,9 +1568,12 @@ impl<'a> BundleOptions<'a> {
         }
     }
 
-    /// `jsx` with what `tsconfig` states laid over it.
+    /// `jsx` with `tsconfig` laid over it.
     pub fn jsx_under(&self, tsconfig: &jsx::Stated) -> jsx::Pragma {
-        jsx::Pragma::resolve(&[&self.jsx_user, &self.jsx_cwd, tsconfig])
+        let mut stated = self.jsx_user.clone();
+        stated.lay_over(&self.jsx_cwd);
+        stated.lay_tsconfig_over(tsconfig, &self.jsx_user_stated);
+        stated.into()
     }
 
     /// The `Pragma` of the file that `result` names. A bundle then writes its own `development` over it.
@@ -1579,7 +1587,9 @@ impl<'a> BundleOptions<'a> {
         }
         for layer in result.jsx.layers.iter().flatten() {
             match layer {
-                JsxLayer::TSConfig(tsconfig) => stated.lay_over(&tsconfig.jsx),
+                JsxLayer::TSConfig(tsconfig) => {
+                    stated.lay_tsconfig_over(&tsconfig.jsx, &self.jsx_user_stated);
+                }
                 // Of what ranks below a package with the "aot" condition, only `development` stays.
                 JsxLayer::AotPackage(own) => {
                     let development = jsx::Pragma::from(stated).development;
@@ -1623,6 +1633,7 @@ impl<'a> BundleOptions<'a> {
             loaders: bun_core::handle_oom(self.loaders.clone()),
             jsx: self.jsx.clone(),
             jsx_user: self.jsx_user.clone(),
+            jsx_user_stated: self.jsx_user_stated.clone(),
             jsx_cwd: self.jsx_cwd.clone(),
             emit_decorator_metadata: self.emit_decorator_metadata,
             experimental_decorators: self.experimental_decorators,
@@ -1899,6 +1910,7 @@ impl<'a> BundleOptions<'a> {
 
             jsx: jsx::Pragma::resolve(&[&jsx_user]),
             jsx_user,
+            jsx_user_stated: transform.jsx.stated(),
             jsx_cwd: jsx::Stated::default(),
             emit_decorator_metadata: false,
             experimental_decorators: false,
@@ -2195,8 +2207,6 @@ fn jsx_for_lays_the_configuration_of_a_file_over_the_options_of_the_program() {
             bunfig: Some(jsx::Stated {
                 runtime: Some(jsx::Runtime::Classic),
                 factory: named(b"user"),
-                fragment: named(b"user"),
-                import_source: Some(jsx::ImportSource::new(b"user")),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2207,7 +2217,8 @@ fn jsx_for_lays_the_configuration_of_a_file_over_the_options_of_the_program() {
         .ok()
         .expect("options");
     // The tsconfig.json of the working directory, then `NODE_ENV=production`.
-    options.lay_over_jsx(&jsx::Stated {
+    options.lay_tsconfig_over_jsx(&jsx::Stated {
+        factory: named(b"cwd"),
         fragment: named(b"cwd"),
         ..Default::default()
     });
@@ -2216,32 +2227,34 @@ fn jsx_for_lays_the_configuration_of_a_file_over_the_options_of_the_program() {
     // A file that lists no configuration takes the options of the program, and one outside the build the defaults.
     assert_eq!(
         jsx_of(&options, [None, None, None]),
-        "Classic development=false user cwd user"
+        "Classic development=false user cwd react"
     );
     assert_eq!(
         show(&options.jsx_for(&bun_resolver::Result::default())),
         "Automatic development=true React React react"
     );
 
-    // Each tsconfig.json that a file lists is over the program and over the one listed before it.
+    // Each tsconfig.json that a file lists is over the program and over the one listed before it, for the options
+    // that the user's sources do not state.
     let own = jsx::Stated {
         runtime: Some(jsx::Runtime::Automatic),
         development: Some(true),
         factory: named(b"own"),
+        fragment: named(b"own"),
         ..Default::default()
     };
     let later = jsx::Stated {
-        factory: named(b"later"),
+        fragment: named(b"later"),
         import_source: Some(jsx::ImportSource::new(b"later")),
         ..Default::default()
     };
     assert_eq!(
         jsx_of(&options, [tsconfig(&own), None, None]),
-        "Automatic development=true own cwd user"
+        "Classic development=true user own react"
     );
     assert_eq!(
         jsx_of(&options, [tsconfig(&own), tsconfig(&later), None]),
-        "Automatic development=true later cwd later"
+        "Classic development=true user later later"
     );
 
     // A package with the "aot" condition takes `development` and nothing else of what ranks below it.
@@ -2255,7 +2268,7 @@ fn jsx_for_lays_the_configuration_of_a_file_over_the_options_of_the_program() {
     );
     assert_eq!(
         jsx_of(&options, [package(&own), None, None]),
-        "Automatic development=true own React react"
+        "Automatic development=true own own react"
     );
 }
 
