@@ -285,6 +285,78 @@ test("--parallel: the workers read the file that --config names, and not ./bunfi
   expect(exitCode).toBe(0);
 });
 
+// A worker reads bunfig.toml itself and is handed the --jsx-* flags as they were typed, an empty value too.
+test.concurrent.each([
+  [
+    "no --jsx-* flag beside a bunfig.toml without a JSX key",
+    `[test]\ncoverage = false\n`,
+    [],
+    "react/jsx-dev-runtime jsxDEV(div) react/jsx-dev-runtime jsxDEV(Fragment)",
+    "react/jsx-dev-runtime jsxDEV(div) react/jsx-dev-runtime jsxDEV(Fragment)",
+  ],
+  [
+    "empty --jsx-* values beside a bunfig.toml",
+    `jsxFactory = "bh"\njsxFragment = "bhf"\njsxImportSource = "bsrc"\n`,
+    ["--jsx-runtime=fallback", "--jsx-factory=", "--jsx-fragment=", "--jsx-import-source=", "--jsx-side-effects"],
+    "React.createElement(div) React.createElement(React.Fragment)",
+    "react/jsx-runtime jsx(div) react/jsx-runtime jsx(Fragment)",
+  ],
+])(
+  "--parallel: the workers transpile JSX as a serial run does, with %s",
+  async (_, bunfig, flags, configured, automatic) => {
+    const runtime = (name: string) => ({
+      [`node_modules/${name}/jsx-runtime.js`]: `export const jsx = type => "${name}/jsx-runtime jsx(" + type + ")", jsxs = jsx, Fragment = "Fragment";`,
+      [`node_modules/${name}/jsx-dev-runtime.js`]: `export const jsxDEV = type => "${name}/jsx-dev-runtime jsxDEV(" + type + ")", Fragment = "Fragment";`,
+    });
+    const file = `
+      import { test } from "bun:test";
+      const call = name => type => name + "(" + type + ")";
+      Object.assign(globalThis, {
+        React: { createElement: call("React.createElement"), Fragment: "React.Fragment" },
+        bh: call("bh"),
+        bhf: "bhf",
+      });
+      test("jsx", () => console.log("JSX " + import.meta.file + ": " + [<div />, <></>].join(" ")));
+    `;
+    using dir = tempDir("parallel-jsx", {
+      // No pragma: the runtime is the one that bunfig.toml and the flags name.
+      "configured.test.jsx": file,
+      "automatic.test.jsx": `/** @jsxRuntime automatic */` + file,
+      "bunfig.toml": bunfig,
+      ...runtime("react"),
+      ...runtime("bsrc"),
+    });
+    const run = async (mode: string[]) => {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", ...mode, ...flags],
+        env: { ...bunEnv, NODE_ENV: undefined, BUN_ENV: undefined },
+        cwd: String(dir),
+        stderr: "pipe",
+        stdout: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return {
+        jsx: (stdout + stderr)
+          .split("\n")
+          .filter(line => line.startsWith("JSX "))
+          .sort(),
+        workers: stdout.includes("PARALLEL"),
+        exitCode,
+      };
+    };
+    const [serial, parallel] = await Promise.all([run([]), run(["--parallel=2"])]);
+
+    const bothFiles = {
+      jsx: [`JSX automatic.test.jsx: ${automatic}`, `JSX configured.test.jsx: ${configured}`],
+      exitCode: 0,
+    };
+    expect({ serial, parallel }).toEqual({
+      serial: { ...bothFiles, workers: false },
+      parallel: { ...bothFiles, workers: true },
+    });
+  },
+);
+
 test("--parallel --bail stops dispatching new files after threshold", async () => {
   // Every file fails, so whichever two the Scanner hands out first will
   // trigger bail before any third file is dispatched. Order-independent.

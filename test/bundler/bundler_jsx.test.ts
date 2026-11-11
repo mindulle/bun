@@ -1120,6 +1120,129 @@ describe("bundler", () => {
     });
   });
 
+  // What `Bun.build()` takes from its `jsx` option, and what a macro and an HTML route take from their build.
+  describe.concurrent("jsx of Bun.build and of an HTML route", () => {
+    test("each key of the jsx option states its option", async () => {
+      const development = `import { jsxDEV, Fragment } from "react/jsx-dev-runtime";`;
+      const production = `import { jsx, Fragment } from "react/jsx-runtime";`;
+      const classic = `console.log(/* @__PURE__ */ React.createElement(React.Fragment, null));`;
+      const unknownRuntime = (runtime: string) =>
+        `Invalid jsx.runtime: '${runtime}'. Must be one of: 'classic', 'automatic', 'react', 'react-jsx', or 'react-jsxdev'`;
+      // [`jsx`, the output line after the name of the entry point or the message of the error, the entry point]
+      const cases: [jsx: object, line: string, entry?: string][] = [
+        [{}, development],
+        // "react-jsx" and "react-jsxdev" state `development` too. The `development` key is read after `runtime`.
+        [{ runtime: "react-jsx" }, production],
+        [{ runtime: "REACT-JSXDEV" }, development],
+        [{ runtime: "react-jsx", development: true }, development],
+        [{ runtime: "react-jsxdev", development: false }, production],
+        [{ runtime: "react" }, classic],
+        // A text that is empty or has no member states nothing. Empty members are left out.
+        [{ runtime: "classic", factory: "", fragment: "" }, classic],
+        [{ runtime: "classic", factory: ".", fragment: ".." }, classic],
+        [{ runtime: "classic", factory: "a..b", fragment: ".c.d." }, `console.log(/* @__PURE__ */ a.b(c.d, null));`],
+        [{ importSource: "" }, development],
+        // `importSource` names the runtime modules and the package whose `createElement` takes a `key` after a spread.
+        [{ importSource: "preact" }, `import { jsxDEV, Fragment } from "preact/jsx-dev-runtime";`],
+        [{ importSource: "preact" }, `import { createElement } from "preact";`, "./key-after-spread.jsx"],
+        [{ runtime: "" }, unknownRuntime("")],
+        [{ runtime: "preserve" }, unknownRuntime("preserve")],
+      ];
+      using dir = tempDir("bun-build-jsx-keys", {
+        "fragment.jsx": `console.log(<></>);`,
+        "key-after-spread.jsx": `const props = {}; console.log(<div {...props} key="k" />);`,
+        "build.fixture.js": `
+          const cases = ${JSON.stringify(cases.map(([jsx, , entry = "./fragment.jsx"]) => [jsx, entry]))};
+          for (const [jsx, entry] of cases) {
+            try {
+              const built = await Bun.build({ entrypoints: [entry], packages: "external", jsx });
+              console.log((await built.outputs[0].text()).split("\\n")[1]);
+            } catch (error) {
+              console.log(error.message);
+            }
+          }
+        `,
+      });
+
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "build.fixture.js"],
+        env: bunEnv,
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({ lines: stdout.trim().split("\n"), stderr, exitCode }).toEqual({
+        lines: cases.map(([, line]) => line),
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+
+    test("a macro is compiled with the jsx option of its build", async () => {
+      using dir = tempDir("bun-build-jsx-macro", {
+        "macro.jsx": `
+          export function element() {
+            globalThis.h = type => "h " + type;
+            return <div />;
+          }
+        `,
+        "index.js": `
+          import { element } from "./macro.jsx" with { type: "macro" };
+          console.log(element());
+        `,
+        "build.fixture.js": `
+          const built = await Bun.build({ entrypoints: ["./index.js"], jsx: { runtime: "classic", factory: "h" } });
+          console.log((await built.outputs[0].text()).split("\\n")[1]);
+        `,
+      });
+
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "build.fixture.js"],
+        env: bunEnv,
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      // A debug build logs the call of the macro to stdout first.
+      expect({ lastLine: stdout.trim().split("\n").pop(), stderr, exitCode }).toEqual({
+        lastLine: `console.log("h div");`,
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+
+    test("a production HTML route compiles JSX for production when the inlined NODE_ENV is not production", async () => {
+      using dir = tempDir("html-route-jsx-mode", {
+        // With this, `NODE_ENV` is "test" in the build of the route: only the mode of the server says production.
+        "bunfig.toml": `[serve.static]\nenv = "inline"\n`,
+        "index.html": `<!doctype html><script type="module" src="./app.jsx"></script>`,
+        "app.jsx": `console.log(<></>);`,
+        "node_modules/react/jsx-runtime.js": `export const jsx = () => "compiled for production", Fragment = "";`,
+        "node_modules/react/jsx-dev-runtime.js": `export const jsxDEV = () => "compiled for development", Fragment = "";`,
+        "serve.fixture.js": `
+          import page from "./index.html";
+          using server = Bun.serve({ port: 0, development: false, routes: { "/": page } });
+          const html = await (await fetch(server.url)).text();
+          const script = html.match(/<script[^>]* src="([^"]+)"/)[1];
+          const js = await (await fetch(new URL(script, server.url))).text();
+          console.log(js.match(/compiled for \\w+/)[0]);
+        `,
+      });
+
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "serve.fixture.js"],
+        env: { ...bunEnv, NODE_ENV: "test" },
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({ stdout, stderr, exitCode }).toEqual({ stdout: "compiled for production\n", stderr: "", exitCode: 0 });
+    });
+  });
+
   // https://github.com/oven-sh/bun/issues/6858
   // The automatic JSX runtime import is synthesized by the bundler. When every
   // JSX expression in a file is tree-shaken, nothing references the generated
