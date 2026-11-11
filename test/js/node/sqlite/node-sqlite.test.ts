@@ -1534,6 +1534,154 @@ describe.skipIf(!sqliteHasSession)("Session / changeset", () => {
     expect({ stdout, stderr, exitCode }).toEqual({ stdout: line + line, stderr: expect.any(String), exitCode: 0 });
   });
 
+  // The session's preupdate hook reads the Table that the running write compiled in, which a schema change frees.
+  describe.skipIf(!sqliteHasSession)("a callback of a write while a session is open", () => {
+    const open = () => {
+      const db = new DatabaseSync(":memory:");
+      db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, a); CREATE TABLE u (x); INSERT INTO u VALUES (1), (2), (3)");
+      return db;
+    };
+    const refused = expect.objectContaining({
+      code: "ERR_INVALID_STATE",
+      message: "database cannot be used in a callback of a write while a session is open",
+    });
+    const write = "INSERT INTO t (id, a) SELECT x, f(x) FROM u";
+
+    test.each([
+      ["exec()", (db: DatabaseSync, write: string) => db.exec(write)],
+      ["run()", (db: DatabaseSync, write: string) => db.prepare(write).run()],
+      ["all()", (db: DatabaseSync, write: string) => db.prepare(write + " RETURNING id").all()],
+      ["iterate()", (db: DatabaseSync, write: string) => [...db.prepare(write + " RETURNING id").iterate()]],
+    ])("of %s cannot use the database", (_name, run) => {
+      const db = open();
+      const session = db.createSession();
+      const caught: unknown[] = [];
+      db.function("f", x => {
+        try {
+          db.exec("ALTER TABLE t ADD COLUMN z");
+        } catch (error) {
+          caught.push(error);
+        }
+        return x;
+      });
+      run(db, write);
+      expect(caught).toEqual([refused, refused, refused]);
+      const copy = open();
+      expect(copy.applyChangeset(session.changeset())).toBe(true);
+      expect(copy.prepare("SELECT * FROM t").all()).toEqual([
+        { id: 1, a: 1 },
+        { id: 2, a: 2 },
+        { id: 3, a: 3 },
+      ]);
+      db.close();
+      copy.close();
+    });
+
+    test("of a trigger that applyChangeset() fires cannot use the database", () => {
+      const source = open();
+      const session = source.createSession();
+      source.exec("INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+      const db = open();
+      db.exec("CREATE TABLE log (a); CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (f(new.a)); END");
+      const target = db.createSession();
+      const caught: unknown[] = [];
+      db.function("f", x => {
+        try {
+          db.prepare("SELECT 1");
+        } catch (error) {
+          caught.push(error);
+        }
+        return x;
+      });
+      expect(db.applyChangeset(session.changeset())).toBe(true);
+      expect(caught).toEqual([refused, refused]);
+      expect(target.changeset().length).toBeGreaterThan(0);
+      source.close();
+      db.close();
+    });
+
+    test("can use it if the session is closed, or the statement only reads", () => {
+      const db = open();
+      const session = db.createSession();
+      db.function("f", x => db.prepare("SELECT ? * 2 AS n").get(x)!.n as number);
+      expect(db.prepare("SELECT f(x) AS n FROM u").all()).toEqual([{ n: 2 }, { n: 4 }, { n: 6 }]);
+      session.close();
+      db.exec(write);
+      expect(db.prepare("SELECT a FROM t").all()).toEqual([{ a: 2 }, { a: 4 }, { a: 6 }]);
+      db.close();
+    });
+
+    test("can use it while a write is parked on a RETURNING row", () => {
+      const db = new DatabaseSync(":memory:");
+      db.exec("CREATE TABLE t (a); CREATE TABLE u (a); INSERT INTO u VALUES (1), (2)");
+      const session = db.createSession();
+      db.function("f", (a: any) => db.prepare("SELECT ? * 10 AS n").get(a)!.n as number);
+      const parked = db.prepare("INSERT INTO t VALUES (5), (6) RETURNING a").iterate();
+      expect(parked.next().value).toEqual({ a: 5 });
+      expect(db.prepare("SELECT f(a) AS n FROM u").all()).toEqual([{ n: 10 }, { n: 20 }]);
+      expect(() => db.exec("INSERT INTO t SELECT f(a) FROM u")).toThrow(/a write while a session is open/);
+      expect([...parked]).toEqual([{ a: 6 }]);
+      session.close();
+      db.close();
+    });
+
+    test("can use it while a write is parked whose statement was collected", () => {
+      const db = new DatabaseSync(":memory:");
+      db.exec("CREATE TABLE t (a); CREATE TABLE u (a); INSERT INTO u VALUES (1), (2)");
+      db.setAuthorizer(() => constants.SQLITE_OK);
+      const session = db.createSession();
+      db.function("f", (a: any) => {
+        Bun.gc(true);
+        return db.prepare("SELECT ? * 10 AS n").get(a)!.n as number;
+      });
+      const park = () => db.prepare("INSERT INTO t VALUES (5), (6) RETURNING a").iterate().next().value;
+      for (let i = 0; i < 20; i++) expect(park()).toEqual({ a: 5 });
+      expect(db.prepare("SELECT f(a) AS n FROM u").all()).toEqual([{ n: 10 }, { n: 20 }]);
+      session.close();
+      db.close();
+    });
+
+    test("conflict and filter callbacks can use it", () => {
+      const source = open();
+      const session = source.createSession();
+      source.exec("INSERT INTO t VALUES (1, 'theirs')");
+      const db = open();
+      db.exec("INSERT INTO t VALUES (1, 'ours')");
+      using target = db.createSession();
+      const seen: unknown[] = [];
+      const applied = db.applyChangeset(session.changeset(), {
+        filter: table => (seen.push(table, db.prepare("SELECT a FROM t").get()!.a), true),
+        onConflict: () => (
+          seen.push(db.prepare("SELECT count(*) AS n FROM t").get()!.n),
+          constants.SQLITE_CHANGESET_OMIT
+        ),
+      });
+      expect({ applied, seen }).toEqual({ applied: true, seen: ["t", "ours", 1] });
+      source.close();
+    });
+
+    test("cannot create one", () => {
+      const db = open();
+      const caught: unknown[] = [];
+      db.function("f", x => {
+        try {
+          db.exec("ALTER TABLE t ADD COLUMN z" + x);
+          db.createSession();
+        } catch (error) {
+          caught.push(error);
+        }
+        return x;
+      });
+      db.exec(write);
+      const cannotCreate = expect.objectContaining({
+        code: "ERR_INVALID_STATE",
+        message: "session cannot be created in a callback of a write",
+      });
+      expect(caught).toEqual([cannotCreate, cannotCreate, cannotCreate]);
+      db.close();
+    });
+  });
+
   test("default onConflict aborts and returns false", () => {
     const src = new DatabaseSync(":memory:");
     const dst = new DatabaseSync(":memory:");

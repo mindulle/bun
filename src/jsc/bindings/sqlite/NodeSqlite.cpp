@@ -598,11 +598,32 @@ void JSDatabaseSync::closeInternal(bool mayCallScript)
 ASCIILiteral JSDatabaseSync::reentryRefusalSlow() const
 {
     // close() always works, and what comes after it reports the closed database.
-    if (!m_db)
+    if (!m_db || !isBusy())
         return {};
     if (m_inAuthorizer)
         return "database cannot be used in an authorizer callback"_s;
+    // Deliberate divergence from Node v26.3.0, where the preupdate hook of the session reads a Table that a schema change freed.
+    if (!m_sessions.isEmpty() && isWriting())
+        return "database cannot be used in a callback of a write while a session is open"_s;
     return {};
+}
+
+bool JSDatabaseSync::isWriting() const
+{
+    if (sqlite3_txn_state(m_db, nullptr) != SQLITE_TXN_WRITE)
+        return false;
+    // A statement that is parked on a RETURNING row made all of its changes in its first step.
+    unsigned parked = m_orphanedStatements.size();
+    for (auto& statement : m_statements) {
+        if (auto* stmt = statement.statement(); stmt && !statement.isStepping() && sqliteCommitsWhenFinalized(stmt))
+            parked++;
+    }
+    unsigned busy = 0;
+    for (auto* stmt = sqlite3_next_stmt(m_db, nullptr); stmt; stmt = sqlite3_next_stmt(m_db, stmt)) {
+        if (sqliteCommitsWhenFinalized(stmt) && ++busy > parked)
+            return true;
+    }
+    return false;
 }
 
 void JSDatabaseSync::finishDeferredClose(bool mayCallScript)
@@ -1275,6 +1296,8 @@ JSC_DEFINE_HOST_FUNCTION(jsDatabaseSyncCreateSession, (JSGlobalObject * globalOb
     REQUIRE_REENTRY_ALLOWED(self);
     if (!lazy_sqlite3_has_session) [[unlikely]]
         return throwSessionUnavailable(globalObject, scope);
+    if (self->isBusy() && self->isWriting()) [[unlikely]]
+        return throwNodeState(globalObject, scope, "session cannot be created in a callback of a write"_s);
     JSDatabaseSync::BusyScope busy { self };
 
     WTF::String table;
@@ -1356,6 +1379,7 @@ static int applyChangesetXConflict(void* pCtx, int eConflict, sqlite3_changeset_
     MarkedArgumentBuffer args;
     args.append(jsNumber(eConflict));
     auto callData = JSC::getCallData(ctx->onConflict);
+    WTF::SetForScope unrestricted { ctx->db->m_unrestrictedBusyDepth, ctx->db->busyDepth() };
     JSValue ret = JSC::call(globalObject, ctx->onConflict, callData, jsNull(), args);
     if (scope.exception()) [[unlikely]] {
         return SQLITE_CHANGESET_ABORT;
@@ -1387,6 +1411,7 @@ static int applyChangesetXFilter(void* pCtx, const char* zTab)
     MarkedArgumentBuffer args;
     args.append(jsString(vm, sqliteText(zTab)));
     auto callData = JSC::getCallData(ctx->filter);
+    WTF::SetForScope unrestricted { ctx->db->m_unrestrictedBusyDepth, ctx->db->busyDepth() };
     JSValue ret = JSC::call(globalObject, ctx->filter, callData, jsNull(), args);
     if (scope.exception()) [[unlikely]] {
         return 0;

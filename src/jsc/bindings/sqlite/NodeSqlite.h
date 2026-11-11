@@ -218,13 +218,16 @@ public:
     // Why script that SQLite called may not use this connection now. Null if it may.
     ASCIILiteral reentryRefusal() const
     {
-        if (!isBusy()) [[likely]]
+        if (m_busyDepth == m_unrestrictedBusyDepth) [[likely]]
             return {};
         return reentryRefusalSlow();
     }
-    // "The authorizer callback must not do anything that will modify the database connection that invoked the
-    // authorizer callback. Note that sqlite3_prepare_v2() and sqlite3_step() both modify their database connections
-    // for the meaning of "modify" in this paragraph." https://sqlite.org/c3ref/set_authorizer.html
+    // Whether a write runs below.
+    bool isWriting() const;
+    unsigned busyDepth() const { return m_busyDepth; }
+    // 0, or the depth of an applyChangeset() whose own callback runs.
+    unsigned m_unrestrictedBusyDepth = 0;
+    // https://sqlite.org/c3ref/set_authorizer.html: the callback must not prepare or step. Deliberate divergence from Node v26.3.0, which lets it.
     bool m_inAuthorizer = false;
 
 private:
