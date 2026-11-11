@@ -1119,7 +1119,7 @@ impl<'a> Resolver<'a> {
     ) -> Option<&'static [u8]> {
         let search = crate::compiled_program::ExtensionSearch {
             extensions: self.opts.ext_order_slice(self.extension_order),
-            extra_extensions: &self.opts.extra_cjs_extensions,
+            extra_extensions: self.opts.extra_cjs_extensions(),
             rewritten_extensions: &|extension, path| {
                 rewritten_file_extensions(extension, || {
                     strings::path_contains_node_modules_folder(path)
@@ -1143,7 +1143,7 @@ impl<'a> Resolver<'a> {
     ) -> PackageLookup {
         let search = crate::compiled_program::ExtensionSearch {
             extensions: self.opts.ext_order_slice(self.extension_order),
-            extra_extensions: &self.opts.extra_cjs_extensions,
+            extra_extensions: self.opts.extra_cjs_extensions(),
             rewritten_extensions: &|extension, path| {
                 rewritten_file_extensions(extension, || {
                     strings::path_contains_node_modules_folder(path)
@@ -1272,7 +1272,7 @@ impl<'a> Resolver<'a> {
     pub fn resolve_embedded_entry_point(&self, specifier: &[u8]) -> Option<&'static [u8]> {
         let search = crate::compiled_program::ExtensionSearch {
             extensions: self.opts.ext_order_slice(self.extension_order),
-            extra_extensions: &self.opts.extra_cjs_extensions,
+            extra_extensions: self.opts.extra_cjs_extensions(),
             rewritten_extensions: &|extension, path| {
                 rewritten_file_extensions(extension, || {
                     strings::path_contains_node_modules_folder(path)
@@ -1322,7 +1322,7 @@ impl<'a> Resolver<'a> {
         )?;
         let search = crate::compiled_program::ExtensionSearch {
             extensions: self.opts.ext_order_slice(self.extension_order),
-            extra_extensions: &self.opts.extra_cjs_extensions,
+            extra_extensions: self.opts.extra_cjs_extensions(),
             rewritten_extensions: &|extension, path| {
                 rewritten_file_extensions(extension, || {
                     strings::path_contains_node_modules_folder(path)
@@ -5647,11 +5647,10 @@ impl<'a> Resolver<'a> {
         // NOTE: index by `0..len` so each iteration takes a fresh short
         // borrow of `self.opts` that ends before `&mut self` is taken by
         // `load_index_with_extension` (avoids the forbidden lifetime-extension cast).
-        let n = self.opts.extra_cjs_extensions.len();
+        let n = self.opts.extra_cjs_extensions().len();
         for i in 0..n {
-            // BACKREF: see `RawSlice` note above — backing `Box<[u8]>` in
-            // `extra_cjs_extensions` is heap-stable for the resolver's life.
-            let ext = bun_ptr::RawSlice::new(&*self.opts.extra_cjs_extensions[i]);
+            // BACKREF: see `RawSlice` note above.
+            let ext = bun_ptr::RawSlice::new(&*self.opts.extra_cjs_extensions()[i]);
             if self
                 .load_index_with_extension(dir_info, &ext, out)
                 .is_success()
@@ -6249,11 +6248,10 @@ impl<'a> Resolver<'a> {
         // NOTE: index by `0..len` so each iteration takes a fresh short
         // borrow of `self.opts` that ends before `&mut self` is taken by
         // `load_extension` (avoids the forbidden lifetime-extension cast).
-        let n = self.opts.extra_cjs_extensions.len();
+        let n = self.opts.extra_cjs_extensions().len();
         for i in 0..n {
-            // BACKREF: see `RawSlice` note above — backing `Box<[u8]>` in
-            // `extra_cjs_extensions` is heap-stable for the resolver's life.
-            let ext = bun_ptr::RawSlice::new(&*self.opts.extra_cjs_extensions[i]);
+            // BACKREF: see `RawSlice` note above.
+            let ext = bun_ptr::RawSlice::new(&*self.opts.extra_cjs_extensions()[i]);
             if let Some(result) = self.load_extension(base, path, &ext, dir_entry) {
                 dec_ret!(Some(result));
             }
