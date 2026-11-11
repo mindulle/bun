@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isASAN, isDebug, isWindows, tempDir, tls } from "harness";
+import { existsSync } from "node:fs";
 import { join } from "path";
 
 // Worker VM startup/teardown is much slower under debug and/or ASAN; these
@@ -1302,6 +1303,37 @@ test(
     expect(stderr).toBe("");
     expect(stdout).toBe(JSON.stringify({ failures: [], leakedFileSinks: 0 }) + "\n");
     expect(exitCode).toBe(0);
+  },
+  timeout,
+);
+
+// `startSamplingProfiler()` makes the directory with the `NodeFS` of the VM, which `destroy()` did not free.
+test.skipIf(!isASAN || isWindows)(
+  "a Worker frees the NodeFS of its VM",
+  async () => {
+    using dir = tempDir("worker-node-fs", {
+      // Not at the top level: leaksan.supp hides what the evaluation of a module allocates.
+      "worker.js": `setImmediate(() => require("bun:jsc").startSamplingProfiler(process.cwd() + "/profile"));`,
+      "main.js": `
+        const worker = new Worker("./worker.js");
+        worker.onerror = event => { throw new Error(event.message); };
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "main.js"],
+      env: {
+        ...bunEnv,
+        BUN_DESTRUCT_VM_ON_EXIT: "1",
+        ASAN_OPTIONS: [bunEnv.ASAN_OPTIONS, "detect_leaks=1"].filter(Boolean).join(":"),
+        LSAN_OPTIONS: `print_suppressions=0:suppressions=${join(import.meta.dirname, "../../../leaksan.supp")}`,
+      },
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+    expect(existsSync(join(String(dir), "profile"))).toBe(true);
   },
   timeout,
 );

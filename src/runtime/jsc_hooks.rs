@@ -707,13 +707,18 @@ unsafe fn configure_debugger(
 /// Reclaim the per-VM [`RuntimeState`] boxed in [`init_runtime_state`]. Called
 /// from `VirtualMachine::deinit` / worker `destroy()` with the opaque pointer
 /// returned by `init_runtime_state`. Clears the thread-local and drops the
-/// `Box`, freeing `timer` + `entry_point`.
+/// `Box`, freeing `timer` + `entry_point`, and the VM's `node_fs`.
 ///
 /// # Safety
 /// `state` must be the exact pointer returned by [`init_runtime_state`] for
 /// this thread (or null), and must not be used again after this call.
-unsafe fn deinit_runtime_state(_vm: *mut VirtualMachine, state: OpaqueRuntimeState) {
+unsafe fn deinit_runtime_state(vm: *mut VirtualMachine, state: OpaqueRuntimeState) {
     RUNTIME_STATE.with(|c| c.set(ptr::null_mut()));
+    // SAFETY: hook contract: `vm` is this thread's live VM.
+    if let Some(node_fs) = unsafe { (*vm).node_fs.take() } {
+        // SAFETY: boxed by `create_node_fs`, and the VM was its only owner.
+        drop(unsafe { bun_core::heap::take(node_fs.cast::<crate::node::fs::NodeFS>()) });
+    }
     // Free the per-thread `TRANSPILE_PRINTER`. Workers lazy-init their own
     // copy in `Bun__transpileFile` / `Bun__transpileVirtualModule`; without this
     // each worker thread strands a `Box<BufferPrinter>` (mirrors the
@@ -1407,7 +1412,7 @@ fn timers_left() -> TimersLeft {
 
 /// `Node.fs.NodeFS{ .vm = … }` lazy creation.
 /// The low tier stores the result in `vm.node_fs: Option<*mut c_void>`.
-/// The returned box is reclaimed (if at all) only by VM teardown.
+/// `deinit_runtime_state` frees the box.
 fn create_node_fs(vm: &mut VirtualMachine) -> *mut c_void {
     use crate::node::fs::NodeFS;
     // `.vm` is set only when standalone-module-graph is active
