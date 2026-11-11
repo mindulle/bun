@@ -56,6 +56,7 @@ Types are organized across multiple `.d.ts` files in the `packages/bun-types` di
 - `index.d.ts` - The main entry point that references all other type files
 - `bun.d.ts` - Core Bun APIs and types
 - `globals.d.ts` - Global type declarations
+- `web-globals.d.ts` - The members of the web globals that Bun implements, for a project that does not load `lib.dom.d.ts` (see [Declarations that lib.dom also has](#declarations-that-libdom-also-has))
 - `test.d.ts` - Testing-related types
 - `sqlite.d.ts` - SQLite-related types
 - `ts7.1/` - Declarations that need TypeScript 7.1 syntax, such as `declare module "*" with { type: "text" }`. Older compilers reject that syntax even with `skipLibCheck`, so `typesVersions` in `package.json` sends TypeScript 7.1 and newer to `ts7.1/index.d.ts`, which references `../index.d.ts` plus the extra files. Every other version keeps loading `index.d.ts`. Prettier and the repository's own `tsconfig.json` skip this folder for the same reason.
@@ -114,24 +115,37 @@ A project can load `lib.dom.d.ts` together with bun-types. The React templates o
 
 So a declaration of bun-types for a global of lib.dom must add nothing when lib.dom is loaded. This is how to gate one:
 
-- An interface gets its members from a base that is `{}` when lib.dom is loaded.
+- An interface gets its members from a base that is `{}` when lib.dom is loaded. The members are in [`./web-globals.d.ts`](./web-globals.d.ts), in an interface of the same name. That file is a module, like the files in `web-globals/` of `@types/node`, so an interface in it is local and is not the global. At its end the file gives `Bun.__internal` the base:
 
   ```typescript
-  declare module "bun" {
-    namespace __internal {
-      interface BunEvent {
-        // the members
-      }
-      type LibEmptyOrBunEvent = LibDomIsLoaded extends true ? {} : BunEvent;
-    }
+  interface AbortController {
+    readonly signal: globalThis.AbortSignal;
+    abort(reason?: any): void;
   }
 
-  interface Event extends Bun.__internal.LibEmptyOrBunEvent {}
+  type LocalAbortController = AbortController;
+
+  declare module "bun" {
+    namespace __internal {
+      type LibOrFallbackAbortController = LibOrFallback<LocalAbortController>;
+    }
+  }
   ```
+
+  `globals.d.ts` declares the global with that base: `interface AbortController extends Bun.__internal.LibOrFallbackAbortController {}`.
 
 - A `var` is typed with `Bun.__internal.UseLibDomIfAvailable<"Name", TypeWithoutLibDom>`.
 
-A member that only Bun has does not go behind the gate, because a project that loads lib.dom then does not get it. Put it in a base that is always on, as `BunHeadersOverride` in [`./fetch.d.ts`](./fetch.d.ts) does for `Headers.toJSON()`.
+Rules for an interface in `web-globals.d.ts`:
+
+- Move the properties as well as the methods. A property that lib.dom declares with another type is an error (TS2717), now or when lib.dom changes.
+- In that file, a name that the file declares is the interface of the file. Write `globalThis.AbortSignal` in the type of a member, so that the type is the global, with everything that `@types/node` and a project add to it.
+- The bases of the global stay on its line in `globals.d.ts`, behind the gate: `interface ErrorEvent extends Bun.__internal.LibOrFallbackErrorEvent, Event {}`. The gate is the first base, so its member wins when a project adds a member of the same name to `Event`.
+- When a member that moves is a member of a base too (`DOMException.message`, `CountQueuingStrategy.size`), the base goes on the interface in `web-globals.d.ts`. There the member overrides the base. On the global line it cannot: two bases that differ in a member are an error (TS2320).
+- `keys()`, `values()`, `entries()` and `[Symbol.iterator]()` go in an interface of their own (`FormDataIterable`), behind `Bun.__internal.LibIterableOrFallback`. Before TypeScript 6.0 lib.dom has them in `lib.dom.iterable.d.ts`, and a project can load `"DOM"` without `"DOM.Iterable"`.
+- A member that only Bun has does not go behind the gate, because a project that loads lib.dom then does not get it. It stays a member of the global interface in `globals.d.ts`, as `Blob.json()` does. For an interface that has its members from another package, put it in a base that is always on, as `BunHeadersOverride` in [`./fetch.d.ts`](./fetch.d.ts) does for `Headers.toJSON()`.
+
+A member that lib.dom has too stays inline in `globals.d.ts` only when the gate would change what a project gets, or when the gate is an error. `Console` and `Navigator` are the second case: `@types/node` gives them a base of its own, and two bases must not differ in a member. The list in the test below has each such member, with the reason.
 
 The case "checks with lib.dom.d.ts" of `test/integration/bun-types/bun-types.test.ts` finds every declaration of bun-types that is not gated. It also finds every gated member, and every static of a gated `var`, that bun-types writes and lib.dom does not have. It compares the result with the list `expectedLibOverlapWithLibDom` in that file, and it fails when the two differ. The comment on `libOverlap` in that file says how to read an entry. The list also has the members that bun-types adds to the interfaces of lib.es, such as `ArrayBuffer` and `Error`.
 
