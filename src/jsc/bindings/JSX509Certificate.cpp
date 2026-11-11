@@ -215,7 +215,7 @@ JSX509Certificate* JSX509Certificate::create(JSC::VM& vm, JSC::Structure* struct
 {
     auto* certificate = create(vm, structure);
     certificate->m_x509 = WTF::move(cert);
-    size_t size = i2d_X509(certificate->m_x509.get(), nullptr);
+    size_t size = std::max(i2d_X509(certificate->m_x509.get(), nullptr), 0);
     certificate->m_extraMemorySizeForGC = size;
     vm.heap.reportExtraMemoryAllocated(certificate, size);
     return certificate;
