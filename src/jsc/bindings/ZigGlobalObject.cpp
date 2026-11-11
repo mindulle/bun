@@ -5450,6 +5450,7 @@ extern "C" void WebWorker__teardownJSCVM(Zig::GlobalObject* globalObject)
     vm.deleteAllCode(JSC::DeleteAllCodeEffort::PreventCollectionAndDeleteAllCode);
     // See Zig__GlobalObject__destructOnExit.
     globalObject->clearDOMGuardedObjects();
+    Bun::forgetAnswersOfPluginsOnThisThread();
     gcUnprotect(globalObject);
     globalObject = nullptr;
 

@@ -399,6 +399,11 @@ void forgetAnswersKeptForLoader(JSGlobalObject* globalObject)
     });
 }
 
+void forgetAnswersOfPluginsOnThisThread()
+{
+    answersOfPluginsOnThisThread() = {};
+}
+
 static void beginOrEndPluginResolutions(JSGlobalObject*, const ScopedLambda<bool(const String& importer)>* shouldCacheForLoader)
 {
     AnswersOfPlugins& answers = answersOfPluginsOnThisThread();
@@ -2495,6 +2500,7 @@ void keepAnswerForLoader(JSGlobalObject*, const BunString*, const BunString*, co
 bool holdsAnswersForLoader() { return false; }
 JSValue errorIfBuildSawNoPlugin(JSGlobalObject*) { return {}; }
 void forgetAnswersKeptForLoader(JSGlobalObject*) {}
+void forgetAnswersOfPluginsOnThisThread() {}
 String fileOfCallerThatWasNotCompiled(VM&, CallFrame*) { return {}; }
 String firstCompiledModuleMatching(JSGlobalObject*, RegExp*) { return {}; }
 JSValue createNotInExecutableError(JSGlobalObject* globalObject, ErrorCode code, const String& path, NotInExecutable)
