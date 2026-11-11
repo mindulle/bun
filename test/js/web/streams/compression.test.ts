@@ -966,6 +966,81 @@ describe("bounded output per input chunk", () => {
     await expect(writer.closed).rejects.toMatchObject({ name: "AbortError" });
   });
 
+  test("addAbortSignal() on the readable mid-expansion settles the write and errors the writable", async () => {
+    const ds = new DecompressionStream("brotli");
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    const write = writer.write(bombs.brotli());
+    const queued = writer.write(new Uint8Array(1));
+
+    const first = await reader.read();
+    expect(first.value!.byteLength).toBeLessThanOrEqual(kDefaultHighWaterMark);
+
+    const controller = new AbortController();
+    addAbortSignal(controller.signal, ds.readable);
+    controller.abort();
+    expect(await write).toBeUndefined();
+    const error = await queued.catch(e => e);
+    expect(error).toMatchObject({ name: "AbortError" });
+    await expect(writer.closed).rejects.toBe(error);
+    await expect(reader.read()).rejects.toBe(error);
+  });
+
+  test("addAbortSignal() on the readable during a multi-step flush settles the close", async () => {
+    const cs = new CompressionStream("zstd", { highWaterMark: 1024 });
+    const writer = cs.writable.getWriter();
+    const reader = cs.readable.getReader();
+    await writer.write(randomBytes(100 * 1024));
+    const closed = writer.close();
+    expect((await reader.read()).value!.byteLength).toBe(1024);
+
+    const controller = new AbortController();
+    addAbortSignal(controller.signal, cs.readable);
+    controller.abort();
+    const error = await closed.catch(e => e);
+    expect(error).toMatchObject({ name: "AbortError" });
+    await expect(reader.read()).rejects.toBe(error);
+  });
+
+  // The first chunk's step is on the thread pool when the readable errors. The second chunk must not reach the same codec
+  // on this thread meanwhile, which crashed, so this runs in a child process.
+  test.concurrent.each(["gzip", "zstd"])(
+    "addAbortSignal() on a served CompressionStream(%p) does not start the next chunk while one is off-thread",
+    async format => {
+      await using proc = Bun.spawn({
+        cmd: [
+          bunExe(),
+          "-e",
+          `
+          const { addAbortSignal } = require("node:stream");
+          const { randomBytes } = require("node:crypto");
+          const controller = new AbortController();
+          const cs = new CompressionStream(${JSON.stringify(format)}, { level: 1 });
+          addAbortSignal(controller.signal, cs.readable);
+          const writer = cs.writable.getWriter();
+          writer.closed.catch(() => {});
+          using server = Bun.serve({ port: 0, fetch: () => new Response(cs.readable) });
+          const response = fetch(server.url, { decompress: false });
+          // Waits for the pump: the sink takes this output.
+          await writer.write(randomBytes(512 * 1024));
+          await (await response).body.getReader().read();
+          const writes = [writer.write(randomBytes(2 * 1024 * 1024)), writer.write(randomBytes(64 * 1024))];
+          controller.abort();
+          for (const { status, reason } of await Promise.allSettled(writes)) console.log(status, reason?.name);
+          process.exit(0);
+          `,
+        ],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      // The server prints the error that ended the response, so stderr is not empty.
+      const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout).toBe("fulfilled undefined\nrejected AbortError\n");
+      expect({ exitCode, signalCode: proc.signalCode }).toEqual({ exitCode: 0, signalCode: null });
+    },
+  );
+
   // An abort during close() is different: the close in progress wins, so a flush
   // being drained keeps going and the reader still gets all of it.
   test("writer.abort() during a multi-step flush does not truncate it", async () => {

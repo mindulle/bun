@@ -163,7 +163,7 @@ static constexpr size_t kAsyncCodecThreshold = 128 * 1024;
 // steps: the readable's pull algorithm and the native sink's onReady call nativeCodecContinue;
 // nativeCodecAbandon is called once the chunk can no longer finish, from whichever side goes
 // away first: the writable starting to error with the write in flight (abort, transform
-// errors), the readable being cancelled, or the sink detaching. The coder holds a pending
+// errors), the readable being cancelled or errored from outside, or the sink detaching. The coder holds a pending
 // chunk's state, so ClearAlgorithms defers the coder release meanwhile (the close algorithm
 // clears algorithms while a multi-step flush is still being drained).
 
@@ -299,6 +299,8 @@ static JSPromise* transformChunk(JSGlobalObject* globalObject, JSTransformStream
     auto& vm = getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     ASSERT(!stream->m_codecPromise);
+    // The step of an abandoned chunk still owns the coder on its pool thread.
+    RELEASE_ASSERT(!stream->m_asyncCodecInFlight);
     ASSERT(coder);
 
     if (inputLen > kAsyncCodecThreshold) {
