@@ -599,6 +599,33 @@ describe("bundler", () => {
       });
     }
 
+    // A require() cycle between two embedded chunks, with no import that
+    // closes it: the chunk that is required again while it is still
+    // evaluating hands out its live bindings.
+    itBundled("compile/splitting/SplitRequireCycleSeesLiveBindings", {
+      compile: true,
+      splitting: true,
+      format: "esm",
+      files: {
+        "/entry.ts": /* js */ `
+          const a = require("./a.ts");
+          console.log("entry sees", Object.keys(a).join());
+        `,
+        "/a.ts": /* js */ `
+          export const early = 1;
+          export const got = require("./b.ts").saw;
+        `,
+        "/b.ts": /* js */ `
+          const a = require("./a.ts");
+          export const saw = "b sees early " + a.early;
+          console.log(saw);
+        `,
+      },
+      run: {
+        stdout: "b sees early 1\nentry sees early,got",
+      },
+    });
+
     // A chunk that is only linked statically has no module namespace object.
     itBundled("compile/splitting/NamespaceObjectsOnlyForImportedChunks", {
       compile: true,
