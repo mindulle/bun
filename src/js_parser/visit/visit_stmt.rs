@@ -2245,11 +2245,22 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     ) -> Result<(), Error> {
         p.visit_expr(&mut data.test);
         let mut lowered_using = false;
+        // The `let` that `finish_case_block_fns` puts in front of the switch, which then shares a block with it.
+        let mut block: Option<StmtList<'a>> = None;
         {
             p.push_scope_for_visit_pass(js_ast::scope::Kind::Block, data.body_loc)
                 .expect("unreachable");
             let old_is_inside_switch = p.fn_or_arrow_data_visit.is_inside_switch;
             p.fn_or_arrow_data_visit.is_inside_switch = true;
+            // SAFETY: current_scope is a valid arena ptr for the parse.
+            let declares_fn = p.current_scope().members.len() != 0 && p.case_block_declares_fn();
+            // `visit_stmts` hands what it lowers a plain function of a clause to over to `p.case_block_fns`.
+            let of_outer_switch = if declares_fn {
+                let of_switch = crate::visit::CaseBlockFns::new(p.arena, p.current_scope);
+                p.case_block_fns.replace(of_switch)
+            } else {
+                None
+            };
             let cases = data.cases.slice_mut();
             for i in 0..cases.len() {
                 if let Some(val) = cases[i].value.as_mut() {
@@ -2258,13 +2269,22 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     // Check("case", *c.Value, c.Value.Loc)
                     //                 p.warnAboutTypeofAndString(s.Test, *c.Value)
                 }
+                if declares_fn {
+                    p.enter_case_clause(i, cases[i].body.slice());
+                }
                 let mut _stmts = stmts_to_list(p.arena, cases[i].body);
                 p.visit_stmts(&mut _stmts, StmtsKind::SwitchStmt)
                     .expect("unreachable");
                 cases[i].body = list_to_stmts(_stmts);
             }
             p.fn_or_arrow_data_visit.is_inside_switch = old_is_inside_switch;
+            if declares_fn {
+                let of_switch = core::mem::replace(&mut p.case_block_fns, of_outer_switch);
+                block = of_switch.and_then(|fns| p.finish_case_block_fns(data, fns));
+            }
+            let out = block.as_mut().unwrap_or(&mut *stmts);
 
+            let cases = data.cases.slice_mut();
             for i in 0..cases.len() {
                 if p.should_lower_using_declarations(cases[i].body.slice()) {
                     lowered_using = true;
@@ -2277,7 +2297,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     ctx.scan_stmts(p, cases[i].body.slice_mut());
                 }
                 let switch_stmt = p.arena.alloc_slice_copy(&[*stmt]);
-                stmts.extend_from_slice(&ctx.finalize(p, switch_stmt, false));
+                out.extend_from_slice(&ctx.finalize(p, switch_stmt, false));
             }
 
             p.pop_scope();
@@ -2285,9 +2305,81 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         // TODO: duplicate case checker
 
         if !lowered_using {
-            stmts.push(*stmt);
+            block.as_mut().unwrap_or(&mut *stmts).push(*stmt);
+        }
+        if let Some(block) = block {
+            let wrapped = p.wrap_switch_with_case_block_fns(data, block, stmt.loc);
+            stmts.push(wrapped);
         }
         Ok(())
+    }
+
+    /// Makes `block` one statement. The discriminant is outside the switch block, so it is read before the `let`.
+    fn wrap_switch_with_case_block_fns(
+        &mut self,
+        data: &mut S::Switch,
+        block: StmtList<'a>,
+        loc: bun_ast::Loc,
+    ) -> Stmt {
+        let p = self;
+        // A renamer takes the `let` for a binding of the switch block, so it can give it a name that the discriminant reads.
+        let mut captures_discriminant = !data.test.is_primitive_literal();
+        // Without a renamer only a binding of the same name captures a bare identifier.
+        if !p.will_use_renamer()
+            && let js_ast::ExprData::EIdentifier(id) = data.test.data
+        {
+            let name = p.symbols[id.ref_.inner_index() as usize]
+                .original_name
+                .slice();
+            captures_discriminant = block.iter().any(|stmt| {
+                let js_ast::StmtData::SLocal(local) = stmt.data else {
+                    return false;
+                };
+                local.decls.slice().iter().any(|decl| {
+                    matches!(decl.binding.data, js_ast::b::B::BIdentifier(b)
+                        if p.symbols[b.r#ref.inner_index() as usize].original_name.slice() == name)
+                })
+            });
+        }
+
+        // `{ const t = v; { let g = function(){}; switch (t) { .. } } }`
+        let discriminant = captures_discriminant.then(|| {
+            let loc = data.test.loc;
+            let temp = p.generate_temp_ref(Some(b"_discriminant"));
+            p.record_declared_symbol(temp);
+            let value = core::mem::replace(&mut data.test, Expr::init_identifier(temp, loc));
+            p.record_usage(temp);
+            let binding = p.b(B::Identifier { r#ref: temp }, loc);
+            p.s(
+                S::Local {
+                    kind: S::Kind::KConst,
+                    decls: G::DeclList::from_slice(&[G::Decl {
+                        binding,
+                        value: Some(value),
+                    }]),
+                    ..Default::default()
+                },
+                loc,
+            )
+        });
+
+        let wrapped = p.s(
+            S::Block {
+                stmts: list_to_stmts(block),
+                close_brace_loc: bun_ast::Loc::EMPTY,
+            },
+            loc,
+        );
+        let Some(discriminant) = discriminant else {
+            return wrapped;
+        };
+        p.s(
+            S::Block {
+                stmts: StmtNodeList::new_mut(p.arena.alloc_slice_copy(&[discriminant, wrapped])),
+                close_brace_loc: bun_ast::Loc::EMPTY,
+            },
+            loc,
+        )
     }
 
     fn s_enum(

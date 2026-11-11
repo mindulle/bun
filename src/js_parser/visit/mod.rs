@@ -24,7 +24,7 @@ use bun_ast::scope::{Kind as ScopeKind, Member as ScopeMember};
 use bun_ast::symbol::Kind as SymbolKind;
 use bun_ast::{
     AssignTarget, B, Binding, BindingNodeIndex, E, Expr, ExprData, ExprNodeList, G, LocRef, S,
-    Stmt, StmtData, Symbol,
+    Stmt, StmtData, StmtNodeList, Symbol,
 };
 use bun_collections::VecExt;
 // `parser::SideEffects` is a stub enum without the assoc fns; the real
@@ -36,6 +36,44 @@ use core::ptr::NonNull;
 
 // In the AST crate, ListManaged is arena-backed.
 type ListManaged<'bump, T> = BumpVec<'bump, T>;
+
+/// What `visit_stmts` lowers the plain functions of the case bodies of one switch to. `finish_case_block_fns` places it.
+pub(crate) struct CaseBlockFns<'a> {
+    /// The block scope of that switch.
+    scope: js_ast::StoreRef<js_ast::Scope>,
+    lowered: ListManaged<'a, LoweredCaseFns<'a>>,
+    /// The clause that `s_switch` visits now, and the functions that its statements declare.
+    clause: usize,
+    clause_fns: ListManaged<'a, Ref>,
+    /// Whether a case test or an earlier clause uses one of them.
+    used_before: bool,
+}
+
+impl<'a> CaseBlockFns<'a> {
+    pub(crate) fn new(arena: &'a bun_alloc::Arena, scope: js_ast::StoreRef<js_ast::Scope>) -> Self {
+        CaseBlockFns {
+            scope,
+            lowered: ListManaged::new_in(arena),
+            clause: 0,
+            clause_fns: ListManaged::new_in(arena),
+            used_before: false,
+        }
+    }
+}
+
+/// The plain functions of one case body, as `visit_stmts` puts them at the head of any other block.
+struct LoweredCaseFns<'a> {
+    /// `let f = function(){}`
+    lets: Stmt,
+    /// `var twin = f` of sloppy code.
+    twin: Option<Stmt>,
+    clause: usize,
+    /// Every function that the clause declares: the engine creates an async or generator function where the switch is entered.
+    fns: ListManaged<'a, Ref>,
+    used_before: bool,
+    /// The uses of `fns` when the clause ends.
+    uses: u32,
+}
 
 impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_ONLY> {
     // Thin alias of `current_scope_mut()` kept for local readability.
@@ -1499,6 +1537,197 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         shadow_ref
     }
 
+    /// Whether a clause of the switch declares a plain function. The block of the switch is the current scope.
+    pub(crate) fn case_block_declares_fn(&self) -> bool {
+        // SAFETY: current_scope is a valid arena ptr for the parse.
+        (self.current_scope().members.values()).any(|member| {
+            self.symbols[member.ref_.inner_index() as usize].kind == SymbolKind::HoistedFunction
+        })
+    }
+
+    /// Says which clause of the switch `visit_stmts` visits next, for what it lowers there.
+    pub(crate) fn enter_case_clause(&mut self, clause: usize, body: &[Stmt]) {
+        let mut clause_fns = ListManaged::new_in(self.arena);
+        for stmt in body {
+            if let StmtData::SFunction(declared) = stmt.data
+                && let Some(name) = declared.func.name
+            {
+                clause_fns.push(name.ref_);
+            }
+        }
+        // A use in a case test or in an earlier clause is a use outside the clause.
+        let used_before = self.uses_of(&clause_fns) != 0;
+        if let Some(of_switch) = self.case_block_fns.as_mut() {
+            (
+                of_switch.clause,
+                of_switch.clause_fns,
+                of_switch.used_before,
+            ) = (clause, clause_fns, used_before);
+        }
+    }
+
+    fn uses_of(&self, fns: &[Ref]) -> u32 {
+        (fns.iter())
+            .map(|f| self.symbols[f.inner_index() as usize].use_count_estimate)
+            .sum()
+    }
+
+    /// Hands the `let` and the `var` in `lowered` to `s_switch`, if the statements are a clause of the switch that it visits.
+    #[cold]
+    fn hand_case_block_fns_to_switch(
+        &mut self,
+        lowered: &mut ListManaged<'a, Stmt>,
+        generated: &[Stmt],
+    ) -> bool {
+        // The Fast Refresh statements of a clause stay behind its `let`, as on main.
+        if self.options.features.react_fast_refresh && !generated.is_empty() {
+            return false;
+        }
+        let scope = self.current_scope;
+        let Some(of_switch) = (self.case_block_fns.as_mut()).filter(|it| it.scope == scope) else {
+            return false;
+        };
+        let fns = core::mem::replace(&mut of_switch.clause_fns, ListManaged::new_in(self.arena));
+        let uses = (fns.iter())
+            .map(|f| self.symbols[f.inner_index() as usize].use_count_estimate)
+            .sum();
+        of_switch.lowered.push(LoweredCaseFns {
+            lets: lowered[0],
+            twin: lowered.get(1).copied(),
+            clause: of_switch.clause,
+            fns,
+            used_before: of_switch.used_before,
+            uses,
+        });
+        lowered.clear();
+        true
+    }
+
+    /// Appends the declarations that a `let f = function(){}` of `visit_stmts` was made from.
+    fn push_lowered_fn_declarations(&mut self, lets: Stmt, out: &mut ListManaged<'a, Stmt>) {
+        let StmtData::SLocal(local) = lets.data else {
+            return;
+        };
+        for decl in local.decls.slice() {
+            let (BData::BIdentifier(name), Some(value)) = (decl.binding.data, decl.value) else {
+                continue;
+            };
+            let ExprData::EFunction(mut function) = value.data else {
+                continue;
+            };
+            let mut func = core::mem::take(&mut function.func);
+            func.name = Some(LocRef {
+                loc: decl.binding.loc,
+                ref_: name.r#ref,
+            });
+            out.push(self.s(S::Function { func }, value.loc));
+        }
+    }
+
+    /// Places what `visit_stmts` lowered the functions of the case bodies to. Returns what goes in front of the switch.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn finish_case_block_fns(
+        &mut self,
+        data: &mut S::Switch,
+        of_switch: CaseBlockFns<'a>,
+    ) -> Option<ListManaged<'a, Stmt>> {
+        let p = self;
+        let lowered = of_switch.lowered;
+        let cases = data.cases.slice_mut();
+
+        // SAFETY: current_scope is a valid arena ptr for the parse.
+        let has_direct_eval = p.current_scope().contains_direct_eval;
+        let is_strict = p.is_strict_mode();
+        // The `let` at the head of the clause is wrong only for a use outside the clause body. Evaluated text can be one.
+        let mut used_outside = has_direct_eval
+            || (lowered.iter()).any(|fns| fns.used_before || fns.uses != p.uses_of(&fns.fns));
+        // The typed file of a library has to type check: it keeps the clause-level `let`.
+        used_outside &= !p.options.features.is_library;
+
+        // What else the switch block declares: a lowered function can read it.
+        let mut stays_in_case_block = cases.iter().any(|case| {
+            case.body.slice().iter().any(|stmt| match stmt.data {
+                StmtData::SFunction(_) | StmtData::SClass(_) => true,
+                StmtData::SLocal(local) => local.kind != LocalKind::KVar,
+                _ => false,
+            })
+        });
+
+        let mut decls: ListManaged<'a, G::Decl> = ListManaged::new_in(p.arena);
+        let mut loc = bun_ast::Loc::EMPTY;
+        for fns in lowered {
+            let StmtData::SLocal(local) = fns.lets.data else {
+                continue;
+            };
+            let mut head: ListManaged<'a, Stmt> = ListManaged::new_in(p.arena);
+            if has_direct_eval && (fns.twin.is_some() || !is_strict) {
+                // Direct "eval": the declaration stays, as in any block. Strict code has no `var` to lose.
+                for decl in local.decls.slice() {
+                    if let BData::BIdentifier(name) = decl.binding.data
+                        && let Some(twin) = p.hoisted_ref_for_sloppy_mode_block_fn.get(&name.r#ref)
+                    {
+                        p.symbols[twin.inner_index() as usize].link.set(name.r#ref);
+                    }
+                }
+                p.push_lowered_fn_declarations(fns.lets, &mut head);
+                stays_in_case_block = true;
+            } else if !used_outside {
+                head.push(fns.lets);
+                head.extend(fns.twin);
+            } else {
+                // Sloppy code assigns the `var` in the clause of the declaration.
+                head.extend(fns.twin);
+                if decls.is_empty() {
+                    loc = fns.lets.loc;
+                }
+                decls.extend_from_slice(local.decls.slice());
+            }
+            if !head.is_empty() {
+                let case = &mut cases[fns.clause];
+                head.extend_from_slice(case.body.slice());
+                case.body = StmtNodeList::from_bump(head);
+            }
+        }
+
+        if decls.is_empty() {
+            return None;
+        }
+
+        if stays_in_case_block {
+            // `{ let g; switch (v) { case (g = function(){}, <first test>): .. } }`
+            let mut assigns = Expr::EMPTY;
+            for decl in decls.iter_mut() {
+                let (BData::BIdentifier(name), Some(value)) =
+                    (decl.binding.data, decl.value.take())
+                else {
+                    continue;
+                };
+                p.record_usage(name.r#ref);
+                assigns = assigns.join_with_comma(Expr::assign(
+                    Expr::init_identifier(name.r#ref, decl.binding.loc),
+                    value,
+                ));
+            }
+            // The first case test always runs, and it runs inside the switch block.
+            if let Some(test) = cases.iter_mut().find_map(|case| case.value.as_mut()) {
+                *test = assigns.join_with_comma(*test);
+            }
+        }
+
+        // `{ let g = function(){}; switch (v) { .. } }`: the caller adds the switch.
+        let mut entry: ListManaged<'a, Stmt> = ListManaged::with_capacity_in(2, p.arena);
+        entry.push(p.s(
+            S::Local {
+                kind: LocalKind::KLet,
+                decls: G::DeclList::from_bump_vec(decls),
+                ..Default::default()
+            },
+            loc,
+        ));
+        Some(entry)
+    }
+
     // Try separating the list for appending, so that it's not a pointer.
     pub(crate) fn visit_stmts(
         &mut self,
@@ -1522,6 +1751,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
 
         #[cfg(debug_assertions)]
         let initial_scope: js_ast::StoreRef<js_ast::Scope> = p.current_scope;
+        let mut let_is_with_switch = false;
 
         {
             // Save the current control-flow liveness. This represents if we are
@@ -1740,6 +1970,12 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     }
                 }
 
+                // Another clause can call a function of a case body, so `s_switch` places its `let` (evanw/esbuild#4533).
+                if p.case_block_fns.is_some() && !before.is_empty() {
+                    let_is_with_switch =
+                        p.hand_case_block_fns_to_switch(&mut before, &non_fn_stmts);
+                }
+
                 before.extend_from_slice(&non_fn_stmts);
             }
 
@@ -1858,7 +2094,8 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             // encounter the constant because we haven't encountered the eval() yet.
             // Inlined constants are not removed if they are in a top-level scope or
             // if they are exported (which could be in a nested TypeScript namespace).
-            if p.const_values.count() > 0 {
+            // The `let` that went to `s_switch` stood first and ended this scan.
+            if p.const_values.count() > 0 && !let_is_with_switch {
                 let items: &mut [Stmt] = stmts.as_mut_slice();
                 for stmt in items.iter_mut() {
                     match stmt.data {
